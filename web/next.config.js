@@ -88,6 +88,11 @@ const nextConfig = {
   // This eliminates the need to copy the full node_modules into Docker production images
   output: "standalone",
 
+  // Next.js 16 blocks cross-origin access to /_next/* in dev. Opening the app
+  // as http://127.0.0.1:3782 while the dev server advertises "localhost" (or
+  // the reverse) breaks HMR and can leave client pages stuck on loaders.
+  allowedDevOrigins: ["127.0.0.1", "localhost"],
+
   // web/proxy.ts (the Next.js middleware) forwards /api/* and /ws/* to the
   // backend by buffering and re-issuing the request. Next caps the buffered
   // request body at 10MB by default, but the backend accepts uploads up to

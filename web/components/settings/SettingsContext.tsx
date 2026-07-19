@@ -535,9 +535,18 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   // can re-run it without remounting the provider.
   const loadSettings = useCallback(async () => {
     setSettingsError(null);
+    // Force the banner back into loading while a retry is in flight.
+    setCatalogEditable(null);
     let settingsLoaded = false;
+    const controller = new AbortController();
+    // Windows/dev: Next proxy can hang on bad localhost→IPv6 routing; never
+    // leave the UI on "Loading settings..." forever.
+    const timeoutMs = 12000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const settingsResponse = await apiFetch(apiUrl("/api/v1/settings"));
+      const settingsResponse = await apiFetch(apiUrl("/api/v1/settings"), {
+        signal: controller.signal,
+      });
       if (!settingsResponse.ok) {
         throw new Error(
           `Settings fetch failed: HTTP ${settingsResponse.status}`,
@@ -557,14 +566,28 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       settingsLoaded = true;
     } catch (err) {
       console.error("Failed to load settings:", err);
-      const message = err instanceof Error ? err.message : String(err);
+      const aborted =
+        (err instanceof DOMException && err.name === "AbortError") ||
+        (err instanceof Error && err.name === "AbortError");
+      const message = aborted
+        ? t(
+            "Timed out loading settings ({{seconds}}s). Check that the backend is reachable at 127.0.0.1 (not only localhost/IPv6).",
+            { seconds: Math.round(timeoutMs / 1000) },
+          )
+        : err instanceof Error
+          ? err.message
+          : String(err);
       setSettingsError(message);
       // Resolve the loading gate so the page can render the error UI instead
       // of staying in an infinite skeleton state.
       setCatalogEditable((current) => (current === null ? false : current));
+    } finally {
+      clearTimeout(timer);
     }
     try {
-      const statusResponse = await apiFetch(apiUrl("/api/v1/system/status"));
+      const statusResponse = await apiFetch(apiUrl("/api/v1/system/status"), {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
       if (statusResponse.ok) {
         setStatus((await statusResponse.json()) as SystemStatus);
       }

@@ -745,7 +745,10 @@ def start(home: str | Path | None = None) -> None:
 
     backend_port = settings.backend_port
     frontend_port = settings.frontend_port
-    backend_url = f"http://localhost:{backend_port}"
+    # Use 127.0.0.1 (not localhost): on Windows, Node resolves localhost to
+    # ::1 first, while uvicorn listens on IPv4 only — proxy /api/* then 500s
+    # and Settings pages hang forever.
+    backend_url = f"http://127.0.0.1:{backend_port}"
     api_base = (
         runtime_env.get("NEXT_PUBLIC_API_BASE_EXTERNAL")
         or runtime_env.get("NEXT_PUBLIC_API_BASE")
@@ -780,7 +783,7 @@ def start(home: str | Path | None = None) -> None:
     if (resolved_backend, resolved_frontend) != (backend_port, frontend_port):
         backend_port, frontend_port = resolved_backend, resolved_frontend
         runtime_env = export_runtime_settings_to_env(overwrite=True)
-        backend_url = f"http://localhost:{backend_port}"
+        backend_url = f"http://127.0.0.1:{backend_port}"
         api_base = (
             runtime_env.get("NEXT_PUBLIC_API_BASE_EXTERNAL")
             or runtime_env.get("NEXT_PUBLIC_API_BASE")

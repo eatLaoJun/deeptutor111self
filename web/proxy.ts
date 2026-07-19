@@ -13,8 +13,10 @@ import {
 // (preferring `next_public_api_base`, then `next_public_api_base_external`,
 // then `http://localhost:${BACKEND_PORT}`). In dev (`deeptutor start`) it
 // defaults to `http://localhost:8001`.
+// Prefer 127.0.0.1 over localhost: Node on Windows resolves localhost → ::1
+// while the backend typically binds IPv4 only, which breaks /api/* rewrites.
 const API_BASE_URL =
-  process.env.DEEPTUTOR_API_BASE_URL ?? "http://localhost:8001";
+  process.env.DEEPTUTOR_API_BASE_URL ?? "http://127.0.0.1:8001";
 
 const AUTH_ENABLED = parseAuthEnabled(process.env.DEEPTUTOR_AUTH_ENABLED);
 
