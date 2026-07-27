@@ -136,3 +136,20 @@ Source extras (.[ extra ], defined in pyproject.toml):
 .[dev]            — Test / lint tooling
 .[all]            — Everything above
 ```
+
+## Project Learning Handbook
+
+`DeepTutor项目学习手册.md` is the durable, human-readable learning
+record for this checkout. When project-related work establishes a stable and
+useful fact about the technology stack, architecture, runtime behavior,
+configuration precedence, or a concrete implementation path, update the
+relevant handbook section in the same turn.
+
+Handbook updates must:
+
+- be written in Simplified Chinese and remain suitable for spoken explanation;
+- distinguish verified facts from open questions or inference;
+- cite concrete source paths, functions, configuration, or runtime evidence;
+- merge into existing sections instead of appending duplicate conclusions;
+- update the handbook change log only for meaningful additions;
+- omit transient search history, raw logs, and unverified guesses.
