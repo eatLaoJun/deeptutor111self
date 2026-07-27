@@ -32,6 +32,7 @@ from deeptutor.core.agentic import (
 from deeptutor.core.agentic.tool_dispatch import MAX_PARALLEL_TOOL_CALLS
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream_bus import StreamBus
+from deeptutor.logging.trace import trace
 from deeptutor.core.trace import (
     build_trace_metadata,
     derive_trace_metadata,
@@ -299,6 +300,11 @@ class AgenticChatPipeline:
         return self.respond_max_tokens
 
     async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
+        # 🔍 AgenticChatPipeline.run 开始：组装本轮工具与客户端，然后建 AgentLoop
+        trace.log(
+            "AgenticChatPipeline.run 开始 | active_cap=%s",
+            context.active_capability or "chat",
+        )
         await self._prepare_deferred_tools(context)
         self._exec_enabled = await self._exec_allowed(context)
         enabled_tools = self._compose_enabled_tools(context)
@@ -309,6 +315,15 @@ class AgenticChatPipeline:
         if tool_schemas is not None and self._deferred_loader is not None:
             tool_schemas.extend(self._deferred_loader.initial_schemas())
             self._deferred_loader.bind_live_schemas(tool_schemas)
+
+        # 🔍 本轮工具组合结果
+        trace.log(
+            "工具组合完成 | enabled=%d native_tools=%s schemas=%d exec=%s",
+            len(enabled_tools),
+            use_native_tools,
+            len(tool_schemas) if tool_schemas else 0,
+            self._exec_enabled,
+        )
 
         loop = AgentLoop(
             pipeline=self,

@@ -17,6 +17,7 @@ from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.stream_bus import StreamBus, register_bus, unregister_bus
 from deeptutor.events.event_bus import Event, EventType, get_event_bus
+from deeptutor.logging.trace import trace
 from deeptutor.runtime.registry.capability_registry import get_capability_registry
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
 
@@ -44,6 +45,14 @@ class ChatOrchestrator:
             context.session_id = str(uuid.uuid4())
 
         cap_name = context.active_capability or "chat"
+        # 🔍 调用链入口：一条用户回合开始
+        trace.log(
+            "ChatOrchestrator.handle 开始 | session=%s cap=%s turn=%s msg=%s",
+            context.session_id,
+            cap_name,
+            context.metadata.get("turn_id", ""),
+            (context.user_message or "")[:120].replace("\n", "\\n"),
+        )
         capability = self._cap_registry.get(cap_name)
 
         if capability is None:
@@ -74,7 +83,10 @@ class ChatOrchestrator:
 
         async def _run() -> None:
             try:
+                # 🔍 进入 Capability.run
+                trace.log("ChatOrchestrator -> capability.run(%s) 开始", cap_name)
                 await capability.run(context, bus)
+                trace.log("capability.run(%s) 正常结束", cap_name)
             except Exception as exc:
                 logger.error("Capability %s failed: %s", cap_name, exc, exc_info=True)
                 await bus.error(str(exc), source=cap_name)
@@ -92,6 +104,8 @@ class ChatOrchestrator:
 
         await task
         await self._publish_completion(context, cap_name)
+        # 🔍 一条用户回合结束
+        trace.log("ChatOrchestrator.handle 结束 | session=%s cap=%s", context.session_id, cap_name)
 
     async def _publish_completion(self, context: UnifiedContext, cap_name: str) -> None:
         """Publish CAPABILITY_COMPLETE to the global EventBus."""

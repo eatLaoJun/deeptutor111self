@@ -35,6 +35,7 @@ from deeptutor.core.agentic.tool_dispatch import DispatchOutcome
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.core.trace import build_trace_metadata, merge_trace_metadata, new_call_id
+from deeptutor.logging.trace import trace
 from deeptutor.services.llm import clean_thinking_tags
 from deeptutor.services.llm.multimodal import should_degrade_to_text, strip_image_parts_inplace
 
@@ -161,6 +162,13 @@ class AgentLoop:
 
     async def run(self) -> None:
         state = AgentLoopState()
+        # 🔍 AgentLoop.run 开始：构造初始 messages 前的 pre-loop 准备
+        trace.log(
+            "AgentLoop.run 开始 | tools=%d schemas=%s rounds_budget=%d",
+            len(self.enabled_tools),
+            "yes" if self.tool_schemas else "no",
+            max(1, self.pipeline.effective_max_rounds(self.context)),
+        )
         # Optional async pre-pass briefings (e.g. explore_context) run BEFORE
         # the answer stage so they form their own preceding activity group and
         # their grounding can ride in the loop's user-message seed.
@@ -185,11 +193,25 @@ class AgentLoop:
                 kb_seed=seed_block,
                 include_tool_manifest=bool(self.tool_schemas),
             )
+            # 🔍 初始 messages 组装完成
+            trace.log(
+                "初始 messages 组装完成 | total=%d (system + history + user)",
+                len(messages),
+            )
             outcome = await self._run_loop(
                 messages=messages,
                 state=state,
                 checkpoint_boundary=len(messages),
             )
+
+        # 🔍 循环结束，输出 RESULT
+        trace.log(
+            "AgentLoop.run 结束 | completed=%s rounds=%d tool_steps=%d final_text_len=%d",
+            outcome.completed,
+            state.rounds,
+            state.tool_steps,
+            len(outcome.final_text),
+        )
 
         if state.sources:
             await self.stream.sources(
@@ -232,7 +254,17 @@ class AgentLoop:
         """
         explore_label = self.pipeline._t("labels.exploring", default="Exploring")
         nudged_empty_finish = False
-        for _round in range(max(1, self.pipeline.effective_max_rounds(self.context))):
+        max_rounds = max(1, self.pipeline.effective_max_rounds(self.context))
+        for _round in range(max_rounds):
+            # 🔍 每轮开始
+            trace.log(
+                "_run_loop 第 %d/%d 轮 | messages=%d prior_rounds=%d prior_tool_steps=%d",
+                _round + 1,
+                max_rounds,
+                len(messages),
+                state.rounds,
+                state.tool_steps,
+            )
             try:
                 result = await self._call_llm(
                     messages=messages,
@@ -265,6 +297,12 @@ class AgentLoop:
                     # plan/script lives there) and nudge it once to act
                     # instead of falling back to an empty answer.
                     nudged_empty_finish = True
+                    # 🔍 空答案纠正：本轮只有推理，没工具也没正文
+                    trace.log(
+                        "第 %d 轮空答案纠正 | raw_text_len=%d",
+                        state.rounds,
+                        len(result.text),
+                    )
                     await self.stream.progress(
                         self.pipeline._t(
                             "notices.empty_finish_nudged",
@@ -296,8 +334,22 @@ class AgentLoop:
                     )
                     continue
                 # Finish: the text streamed live this round IS the answer.
+                # 🔍 正常结束：本轮无 tool_calls，文本即最终答案
+                trace.log(
+                    "第 %d 轮 FINISH（无 tool_calls）| text_len=%d finish_reason=%s",
+                    state.rounds,
+                    len(final_text),
+                    result.finish_reason,
+                )
                 return await self._finalize_finish(final_text)
 
+            # 🔍 本轮有 tool_calls，进入工具分发
+            trace.log(
+                "第 %d 轮 tool_calls=%d names=%s",
+                state.rounds,
+                len(result.tool_calls),
+                [tc.get("name") for tc in result.tool_calls],
+            )
             messages.append(_assistant_message_with_tool_calls(result.text, result.tool_calls))
             dispatch = await self.pipeline._dispatch_tool_calls(
                 tool_calls=result.tool_calls,
@@ -309,8 +361,23 @@ class AgentLoop:
             state.tool_steps += 1
             state.sources.extend(dispatch.sources)
             messages.extend(dispatch.tool_messages)
+            # 🔍 工具分发完成
+            trace.log(
+                "第 %d 轮工具分发完成 | tool_msgs=%d pause=%s terminate=%s msgs=%d",
+                state.rounds,
+                len(dispatch.tool_messages),
+                bool(dispatch.pause),
+                bool(dispatch.terminate),
+                len(messages),
+            )
 
             if dispatch.pause:
+                # 🔍 ask_user 暂停，等用户回答
+                trace.log(
+                    "第 %d 轮 PAUSE（ask_user）| tool_call_id=%s",
+                    state.rounds,
+                    dispatch.pause_tool_call_id,
+                )
                 resumed = await self.pipeline._await_user_reply_and_resolve(
                     context=self.context,
                     stream=self.stream,
@@ -319,9 +386,11 @@ class AgentLoop:
                 if not resumed:
                     # The pending question is already the turn's final
                     # artefact (or the user abandoned the turn) — stop.
+                    trace.log("第 %d 轮暂停未恢复 -> completed=False", state.rounds)
                     return LoopOutcome(final_text="", completed=False)
                 # The user's answers were substituted into the matching
                 # ``role=tool`` message; the next round sees them in-protocol.
+                trace.log("第 %d 轮暂停已恢复 -> 继续", state.rounds)
                 continue
 
             checkpoint_boundary = self._fold_context_checkpoint(
@@ -332,6 +401,12 @@ class AgentLoop:
 
             if dispatch.terminate:
                 payload = dispatch.terminate_payload or {}
+                # 🔍 终止工具：内容直接成为最终产物
+                trace.log(
+                    "第 %d 轮 TERMINATE | content_len=%d",
+                    state.rounds,
+                    len(str(payload.get("content") or "")),
+                )
                 await self.pipeline._emit_terminator_final_response(self.stream, payload)
                 return LoopOutcome(
                     final_text=str(payload.get("content") or ""),
@@ -339,6 +414,10 @@ class AgentLoop:
                 )
 
         # Round budget ran out while still requesting tools — force a finish.
+        # 🔍 轮数预算耗尽，强制收尾
+        trace.log(
+            "%d 轮预算耗尽 -> 强制收尾 forced_finish", max_rounds
+        )
         return await self._forced_finish(messages, state)
 
     def _fold_context_checkpoint(
@@ -368,6 +447,8 @@ class AgentLoop:
         *,
         reason: str = "budget",
     ) -> LoopOutcome:
+        # 🔍 强制收尾：禁用工具再调用一次 LLM
+        trace.log("_forced_finish 开始 | reason=%s messages=%d", reason, len(messages))
         if reason == "error":
             notice = self.pipeline._t(
                 "notices.loop_error_finish",
@@ -433,6 +514,15 @@ class AgentLoop:
         await self.pipeline._guard_context_window(messages, self.stream)
         stage = LOOP_STAGE
         call_id = new_call_id(f"chat-{stage}")
+        # 🔍 单轮 LLM 调用开始
+        trace.log(
+            "_call_llm 开始 | call_kind=%s model=%s msgs=%d tools=%s max_tokens=%d",
+            call_kind,
+            self.pipeline.model,
+            len(messages),
+            "yes" if tool_schemas else "no",
+            max_tokens,
+        )
         trace_meta = build_trace_metadata(
             call_id=call_id,
             phase=stage,
@@ -576,6 +666,14 @@ class AgentLoop:
                     "call_role": "narration" if tool_calls else "finish",
                 },
             ),
+        )
+        # 🔍 单轮 LLM 调用结束
+        trace.log(
+            "_call_llm 结束 | call_role=%s text_len=%d tool_calls=%d finish_reason=%s",
+            "narration" if tool_calls else "finish",
+            len(text),
+            len(tool_calls),
+            finish_reason,
         )
         return LLMCallResult(text=text, tool_calls=tool_calls, finish_reason=finish_reason)
 
