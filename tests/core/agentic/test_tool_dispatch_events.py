@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from deeptutor.core.agentic import tool_dispatch as tool_dispatch_module
 from deeptutor.core.agentic.tool_dispatch import dispatch_tool_calls
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
@@ -26,6 +27,11 @@ from deeptutor.services.sandbox import Mount
 class _Registry:
     async def execute(self, name: str, **kwargs: Any) -> ToolResult:
         return ToolResult(content="ok", success=True)
+
+
+class _FailingRegistry:
+    async def execute(self, name: str, **kwargs: Any) -> ToolResult:
+        raise RuntimeError("boom")
 
 
 def _augment(tool_name: str, tool_args: dict[str, Any], _ctx: UnifiedContext) -> dict[str, Any]:
@@ -72,3 +78,79 @@ async def test_tool_call_event_args_exclude_private_kwargs() -> None:
     # The whole event must survive strict JSON serialization — this is what
     # the WS push and the turn-event store both rely on.
     json.dumps(tool_calls[0].to_dict())
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_trace_logs_start_and_success_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+
+    def _record(message: str, *args: object) -> None:
+        messages.append(message % args)
+
+    monkeypatch.setattr(tool_dispatch_module.trace, "log", _record)
+
+    await dispatch_tool_calls(
+        tool_calls=[
+            {
+                "id": "call-1",
+                "name": "web_search",
+                "arguments": json.dumps(
+                    {"query": "agent loop", "api_token": "do-not-log"}
+                ),
+            }
+        ],
+        context=UnifiedContext(session_id="s1", user_message="hi"),
+        stream=StreamBus(),
+        source="chat",
+        stage="responding",
+        iteration_index=0,
+        registry=_Registry(),
+    )
+
+    assert any(
+        "工具调用开始 | name=web_search call_id=call-1" in message
+        for message in messages
+    )
+    assert any(
+        "工具调用结束 | name=web_search call_id=call-1 success=True" in message
+        for message in messages
+    )
+    assert "agent loop" in messages[0]
+    assert "do-not-log" not in "\n".join(messages)
+    assert "<redacted>" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_trace_logs_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+
+    def _record(message: str, *args: object) -> None:
+        messages.append(message % args)
+
+    monkeypatch.setattr(tool_dispatch_module.trace, "log", _record)
+
+    outcome = await dispatch_tool_calls(
+        tool_calls=[
+            {
+                "id": "call-2",
+                "name": "exec",
+                "arguments": json.dumps({"command": "false"}),
+            }
+        ],
+        context=UnifiedContext(session_id="s1", user_message="hi"),
+        stream=StreamBus(),
+        source="chat",
+        stage="responding",
+        iteration_index=0,
+        registry=_FailingRegistry(),
+    )
+
+    assert any(
+        "工具调用失败 | name=exec call_id=call-2" in message and "error=boom" in message
+        for message in messages
+    )
+    assert outcome.tool_messages[0]["content"].startswith("Error executing exec:")

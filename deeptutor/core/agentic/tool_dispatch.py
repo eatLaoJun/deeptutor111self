@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 import logging
+from time import perf_counter
 from typing import Any
 
 from deeptutor.core.context import UnifiedContext
@@ -33,12 +34,23 @@ from deeptutor.core.trace import (
     merge_trace_metadata,
     new_call_id,
 )
+from deeptutor.logging.trace import trace
 from deeptutor.runtime.registry.tool_registry import ToolRegistry, get_tool_registry
 from deeptutor.utils.json_parser import parse_json_response
 
 logger = logging.getLogger(__name__)
 
 MAX_PARALLEL_TOOL_CALLS = 8
+_TRACE_ARGS_MAX_CHARS = 500
+_SENSITIVE_ARG_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+)
 
 
 KwargAugmenter = Callable[[str, dict[str, Any], UnifiedContext], dict[str, Any]]
@@ -157,6 +169,7 @@ async def dispatch_tool_calls(
             registry=registry,
             tool_name=tool_name,
             tool_args=exec_args,
+            tool_call_id=_tcid,
             stream=stream,
             source=source,
             stage=stage,
@@ -326,6 +339,7 @@ async def execute_tool_call(
     registry: ToolRegistry,
     tool_name: str,
     tool_args: dict[str, Any],
+    tool_call_id: str = "",
     stream: StreamBus,
     source: str,
     stage: str,
@@ -342,6 +356,14 @@ async def execute_tool_call(
     internally). Capabilities that want to invoke a single tool outside the
     parallel-dispatch path call this directly.
     """
+    call_ref = tool_call_id or "-"
+    started_at = perf_counter()
+    trace.log(
+        "工具调用开始 | name=%s call_id=%s args=%s",
+        tool_name,
+        call_ref,
+        _format_tool_args_for_trace(tool_args),
+    )
 
     async def _event_sink(
         event_type: str,
@@ -379,6 +401,17 @@ async def execute_tool_call(
             event_sink=_event_sink if retrieve_meta is not None else None,
             **tool_args,
         )
+        trace.log(
+            "工具调用结束 | name=%s call_id=%s success=%s result_len=%d "
+            "elapsed_ms=%.1f pause=%s terminate=%s",
+            tool_name,
+            call_ref,
+            result.success,
+            len(result.content or ""),
+            (perf_counter() - started_at) * 1000,
+            bool(getattr(result, "pause_for_user", None)),
+            bool(getattr(result, "terminate_turn", False)),
+        )
         if retrieve_meta is not None:
             await stream.progress(
                 f"Retrieve complete ({len(result.content)} chars)",
@@ -399,6 +432,13 @@ async def execute_tool_call(
             "pause_for_user": getattr(result, "pause_for_user", None),
         }
     except Exception as exc:
+        trace.log(
+            "工具调用失败 | name=%s call_id=%s elapsed_ms=%.1f error=%s",
+            tool_name,
+            call_ref,
+            (perf_counter() - started_at) * 1000,
+            exc,
+        )
         logger.error("Tool %s failed", tool_name, exc_info=True)
         if retrieve_meta is not None:
             await stream.error(
@@ -425,6 +465,28 @@ async def execute_tool_call(
             "terminate_turn": False,
             "pause_for_user": None,
         }
+
+
+def _format_tool_args_for_trace(tool_args: dict[str, Any]) -> str:
+    """Return a bounded, JSON-like preview without private or secret values."""
+    safe_args: dict[str, Any] = {}
+    for key, value in tool_args.items():
+        key_text = str(key)
+        key_lower = key_text.lower()
+        if key_text.startswith("_"):
+            continue
+        safe_args[key_text] = (
+            "<redacted>"
+            if any(fragment in key_lower for fragment in _SENSITIVE_ARG_FRAGMENTS)
+            else value
+        )
+    try:
+        preview = json.dumps(safe_args, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        preview = str(safe_args)
+    if len(preview) > _TRACE_ARGS_MAX_CHARS:
+        return preview[:_TRACE_ARGS_MAX_CHARS].rstrip() + "...[truncated]"
+    return preview
 
 
 async def _collect_outcome(

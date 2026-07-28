@@ -6,7 +6,7 @@
 >
 > 使用方式：既可以直接阅读，也可以把本文档交给 GPT，在语音通话中按章节讲解和提问。
 >
-> 当前基线：`main` 分支，提交 `c5195899`，最后更新于 2026-07-27。
+> 当前基线：`main` 分支，提交 `c5195899`，最后更新于 2026-07-28。
 
 ## 目录
 
@@ -197,9 +197,66 @@ ToolRegistry    CapabilityRegistry
 
 关键设计点：入口层不应为不同 Capability 各造一套参数。所有入口先把数据整理成 `UnifiedContext`，后面的编排和扩展机制才能保持一致。
 
+可以把它理解为一次回合的“请求包”：
+
+```text
+WebSocket / CLI / Python SDK
+            ↓
+把各自的输入整理为 UnifiedContext
+            ↓
+ChatOrchestrator.handle(context)
+            ↓
+Capability.run(context, stream)
+            ↓
+Pipeline 根据 context 组装 Prompt、工具和附件
+```
+
+它是一个 Python `dataclass`，通常只服务于当前回合。它不是：
+
+- HTTP Request 对象；
+- 数据库里的会话记录；
+- 全局单例；
+- Agent Loop 自己的循环状态。
+
+重要字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `session_id` | 当前会话标识；为空时 Orchestrator 会生成 |
+| `user_message` | 当前这一轮的用户消息 |
+| `conversation_history` | 之前的 user/assistant 消息 |
+| `enabled_tools` | 用户显式开启的可选工具 |
+| `allowed_builtin_tools` | 内置自动挂载工具的权限白名单 |
+| `active_capability` | 本轮选择的能力；为空时默认 `chat` |
+| `knowledge_bases` | 本轮挂载的知识库名称 |
+| `attachments` | 图片、PDF 或其他文件 |
+| `config_overrides` | 本轮临时配置覆盖 |
+| `language` | Prompt 和输出语言 |
+| `memory_context` | 注入系统提示词的记忆内容 |
+| `persona_context` | 当前 Persona/Soul 指令 |
+| `skills_manifest` | 当前用户可见的 Skill 清单 |
+| `source_manifest` | 已附加来源的简要目录 |
+| `metadata` | turn id、source index、用户等待器等扩展数据 |
+
+一个最小例子：
+
+```python
+context = UnifiedContext(
+    session_id="session-123",
+    user_message="解释傅里叶变换",
+    active_capability="chat",
+    enabled_tools=["web_search"],
+    language="zh",
+)
+```
+
+`ChatOrchestrator` 不会解析这些业务字段，而是把完整 Context 路由给选中的
+Capability。`AgenticChatPipeline` 才会读取其中的知识库、附件、工具、Memory、
+Skill 和 metadata，生成本轮真正传给模型的 messages 和 tool schemas。
+
 ### 5.2 Tool
 
-**状态：已验证到架构层，具体装载链待深入**
+**状态：已验证到注册、装载、调用和结果回填**
 
 Tool 是单次函数能力，由 LLM 在 agent 循环中按需选择。例如：
 
@@ -214,6 +271,55 @@ Tool 是单次函数能力，由 LLM 在 agent 循环中按需选择。例如：
 Tool 的基础协议位于 `deeptutor/core/tool_protocol.py`，注册表位于 `deeptutor/runtime/registry/tool_registry.py`。
 
 并非所有 Tool 都永久暴露。部分工具根据知识库、附件、沙箱等上下文条件自动挂载，这可以减少无关工具对模型上下文的占用。
+
+#### 工具存在哪里
+
+需要区分四种不同的“存储”：
+
+| 层次 | 存放位置 | 存放内容 |
+| --- | --- | --- |
+| 源代码 | `deeptutor/tools/`、`deeptutor/tools/builtin/__init__.py` | 工具类、参数定义和 `execute()` 实现 |
+| 进程运行时 | 全局 `ToolRegistry._tools` 字典 | `工具名 -> BaseTool 实例` |
+| 当前回合 | `AgentLoop.enabled_tools`、`AgentLoop.tool_schemas` | 本回合可用工具名和 function-calling schema |
+| 对话循环 | `AgentLoop` 的 `messages` 列表 | assistant 的 tool call 和执行后的 `role=tool` 结果 |
+
+`BUILTIN_TOOL_TYPES` 是内置工具类清单。首次调用 `get_tool_registry()` 时，
+`ToolRegistry.load_builtins()` 会实例化这些类，并通过
+`self._tools[tool.name] = tool` 保存到当前 Python 进程的内存中。
+
+模型不会收到 Python 工具对象或 `execute()` 源代码。它只收到由
+`ToolDefinition.to_openai_schema()` 生成的 JSON schema，例如工具名、说明、
+参数类型和必填项。真正的工具实例始终留在服务端注册表中。
+
+#### 工具怎样交给当前 AgentLoop
+
+```text
+BUILTIN_TOOL_TYPES
+  -> ToolRegistry._tools：注册全部可用工具实例
+  -> _compose_enabled_tools(context)：选出本回合允许使用的工具名
+  -> _build_llm_tool_schemas(...)：生成本回合工具 schemas
+  -> AgentLoop(enabled_tools=..., tool_schemas=...)
+  -> _call_llm(): kwargs["tools"] = tool_schemas
+  -> 模型返回 tool_calls
+  -> dispatch_tool_calls()
+  -> ToolRegistry.execute(name, **args)
+  -> BaseTool.execute(**args)
+  -> ToolResult
+  -> 转为 role=tool 消息，进入下一轮 LLM
+```
+
+也就是说，传给 `AgentLoop` 的不是“全部工具代码”，而是：
+
+1. `enabled_tools`：本回合启用的工具名称，主要用于 Prompt 和运行时控制。
+2. `tool_schemas`：真正发给模型的工具调用协议。
+
+模型根据 schema 产生工具名和 JSON 参数；服务端再按工具名回到
+`ToolRegistry._tools` 查找实例并执行。
+
+Deferred MCP 工具还有一层会话级记录：
+`deeptutor/services/mcp/session_state.py` 会把已经动态加载的**工具名称**
+保存到当前 chat session 工作区的 `loaded_tools.json`。这里持久化的仍然只是
+名称，不是 Python 工具实例，也不是完整工具源代码。
 
 ### 5.3 Capability
 
@@ -571,6 +677,25 @@ tool_choice = "auto"
 
 这就是 Agent 获得“观察结果”并继续决策的闭环。
 
+#### 工具执行日志
+
+所有经过 `execute_tool_call()` 的工具现在都会输出统一的后端 TRACE：
+
+```text
+[TRACE] 工具调用开始 | name=web_search call_id=call_xxx args={"query":"..."}
+[TRACE] 工具调用结束 | name=web_search call_id=call_xxx success=True result_len=1234 elapsed_ms=85.2 pause=False terminate=False
+```
+
+异常时输出：
+
+```text
+[TRACE] 工具调用失败 | name=exec call_id=call_xxx elapsed_ms=12.4 error=...
+```
+
+日志中的参数最多保留 500 个字符；以下划线开头的服务端私有参数不会输出，
+`token`、`password`、`secret`、`api_key` 等密钥类字段会显示为
+`<redacted>`。日志只记录结果长度和执行状态，不输出完整工具结果。
+
 ### 6.8 重复调用、Deferred Tools 和 Context Checkpoint
 
 **状态：已验证**
@@ -905,6 +1030,40 @@ http://127.0.0.1:3782
 
 详细结论见[第 6 章](#6-一次对话的主调用链)。
 
+#### 初学者第一遍阅读顺序
+
+第一遍只沿默认 Chat 主链阅读，不要从大目录中随机挑文件：
+
+1. `deeptutor/core/context.py`
+   - 只回答：一次用户回合携带哪些统一数据？
+2. `deeptutor/runtime/orchestrator.py`
+   - 只回答：如何选择 Capability，如何管理 StreamBus？
+3. `deeptutor/agents/chat/capability.py`
+   - 只回答：ChatCapability 把工作交给了谁？
+4. `deeptutor/agents/chat/agentic_pipeline.py`
+   - 第一遍只看 `__init__()`、`run()`、`_build_loop_messages()`、
+     `_compose_enabled_tools()` 和 `_dispatch_tool_calls()`。
+5. `deeptutor/agents/chat/agent_loop.py`
+   - 先看顶部设计说明，再看 `run()`、`_run_loop()`、`_call_llm()`、
+     `_forced_finish()`。
+6. `deeptutor/core/agentic/tool_dispatch.py`
+   - 重点看 `dispatch_tool_calls()`、`execute_tool_call()`、
+     `_collect_outcome()`。
+
+每个文件第一遍只回答两个问题：
+
+1. 它接收什么？
+2. 它把结果交给谁？
+
+第一遍暂缓阅读：
+
+- `deeptutor/core/agentic/loop.py` 和 `labeled_step.py`：这是另一套标签协议循环。
+- `deeptutor/agents/research/`、`question/`：先理解默认 Chat，再学习复杂状态机。
+- `deeptutor/services/`：目录很大，等主链遇到具体服务时再向下追。
+- `web/`：先理解后端事件生产，再追前端事件消费。
+- `deeptutor/agents/chat/chat_agent.py`、`session_manager.py`：不在当前默认 Chat
+  Agent Loop 的最短核心阅读路径上。
+
 ### 第三阶段：追通 Web 入口
 
 从 `deeptutor/api/routers/unified_ws.py` 向内追踪：
@@ -1001,6 +1160,12 @@ http://127.0.0.1:3782
 
 ## 13. 更新记录
 
+### 2026-07-28
+
+- 扩展 `UnifiedContext`：补充其请求包定位、字段职责、数据流和与会话存储/循环状态的区别。
+- 补充 Tool 完整调用链：区分源代码、运行时注册表、当前回合 schema 和对话消息，并说明工具如何交给 AgentLoop。
+- 为统一工具执行入口增加开始、成功和失败 TRACE，并对参数预览进行长度限制和敏感字段脱敏。
+
 ### 2026-07-27
 
 - 建立学习手册。
@@ -1009,3 +1174,4 @@ http://127.0.0.1:3782
 - 完整追踪默认 chat Agent Loop：工具挂载、Prompt、流式模型调用、并行工具执行、暂停恢复、上下文保护、退出与兜底。
 - 区分 chat 专用原生 tool-call loop 与 Research/Question 使用的通用 labeled loop。
 - 安装 `pytest`、`pytest-asyncio`，Agent Loop 相关 48 项测试全部通过。
+- 增加初学者阅读顺序和第一遍暂缓目录，避免从大目录随机阅读。

@@ -1,5 +1,5 @@
 ﻿$ErrorActionPreference = "Stop"
-Set-Location "C:\file\ownWork\DeepTutor"
+Set-Location $PSScriptRoot
 
 # Clash actual port is 7897 (NOT 7890). DeepTutor/httpx reads these env vars.
 $env:HTTP_PROXY  = "http://127.0.0.1:7897"
