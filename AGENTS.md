@@ -152,4 +152,9 @@ Handbook updates must:
 - cite concrete source paths, functions, configuration, or runtime evidence;
 - merge into existing sections instead of appending duplicate conclusions;
 - update the handbook change log only for meaningful additions;
-- omit transient search history, raw logs, and unverified guesses.
+- omit transient search history, raw logs, and unverified guesses;
+- be applied **proactively and without asking for confirmation** when the fact
+  is verified. Do NOT ask "should I add this to the handbook?" — verifying a
+  fact in code is already the trigger; just merge it into the relevant section
+  in the same turn. Only ask when there is genuine ambiguity about *which*
+  section a fact belongs in.

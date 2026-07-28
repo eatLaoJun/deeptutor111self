@@ -531,7 +531,7 @@ Anthropic 后端通过适配器转换为 OpenAI Chat Completions 形态；Azure 
 
 每条用户回合都重新组装一份 system prompt，并不区分“第一次”或“往后”。
 
-- **跨回合**：每发一条用户消息进入 `AgentLoop.run()`，都会再调一次 `AgenticChatPipeline._build_loop_messages()`，其中 `_build_system_prompt()` 重新拼出整个 system 文本；历史由 `turn_runtime` 把上一回合存下的 `conversation_history` 装回 `UnifiedContext` 后一并注入。
+- **跨回合**：每发一条用户消息进入 `AgentLoop.run()`，都会再调一次 `AgenticChatPipeline._build_loop_messages()`，其中 `_build_system_prompt()` 重新拼出整个 system 文本；历史由 `turn_runtime` 把上一回合存下的 `conversation_history` 装回 `UnifiedContext` 后一并注入。`_build_loop_messages` 是总入口、`_build_system_prompt` 是其子步骤，两者面对同一份 `UnifiedContext` 取料——总入口自己取历史与当前用户消息，子步骤取 capability/tools/记忆等料拼 system；成品写进 `messages`，从不写回 `UnifiedContext`。
 - **回合内的多轮 LLM 调用**：system prompt 不再重建。它作为 `messages[0]` 一直留在列表里，后续轮次只向列表追加 assistant（含 tool_calls）和 `role=tool` 消息。
 
 `messages[0]` 即 system，固定 role=system、位于列表第一条，由 `_build_loop_messages` 直接写入：
@@ -542,10 +542,35 @@ messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
 
 因此一条 `[TRACE] 初始 messages 组装完成 | total=N` 里的 `N` 能反推本回合形态：新会话第一条消息时历史为空，`N = 2`（system + user）；续聊则有 `1 + 2k(历史) + 1 = 奇数`。
 
+#### 历史消息的 role 由上一回合盖好章，本轮只搬运
+
+`_build_loop_messages` 遍历 `context.conversation_history` 时**不重新分配 role**，沿用每条历史条目在上一回合产生时已有的 role，只做「过滤 + 搬运」：
+
+| 历史条目 role | 进 messages 的 role | 处理 |
+| --- | --- | --- |
+| `user` | `user` | 原样照搬 |
+| `assistant` | `assistant` | 原样照搬 |
+| `system` | `system` | 加 header「[Conversation summary]」，role 仍为 system（这类条目是 `ContextBuilder` 在历史过长时压缩出的摘要） |
+| 其它 / content 为空 | —— | 被丢弃，不 append |
+
+关键认知：role 盖章发生在**上回合产生消息的那一刻**（用户发消息存为 `role=user`、模型回答存为 `role=assistant`），到这一回合历史已是带标签的干净数据，代码只读签不改签——只有 `system`（压缩摘要）那一类加 header，role 不变。等价的源码骨架：
+
+```python
+for item in context.conversation_history:
+    role = item.get("role")
+    content = item.get("content")
+    if role in {"user", "assistant"} and isinstance(content, (str, list)):
+        messages.append({"role": role, "content": content})   # 原样照搬
+    elif role == "system" and isinstance(content, str) and content.strip():
+        messages.append({"role": "system", "content": f"{header}\n{content}"})
+    # 其它情况:丢弃
+```
+
 证据：
 
 - `deeptutor/agents/chat/agentic_pipeline.py:340`（`_build_system_prompt`）
 - `deeptutor/agents/chat/agentic_pipeline.py:360-401`（`_build_loop_messages`，写入 `messages[0]` 并遍历 `context.conversation_history`）
+- `deeptutor/agents/chat/agentic_pipeline.py:385-399`（历史 role 沿用 + system 摘要加 header）
 - `deeptutor/agents/chat/prompt_blocks.py:19-93`（`ChatPromptAssembler.system_prompt` 拼装各块）
 - `deeptutor/agents/chat/prompts/zh/agentic_chat.yaml`
 - `deeptutor/services/session/turn_runtime.py:1616`（每回合把上一回合历史装回 `UnifiedContext`）
@@ -1176,6 +1201,11 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-07-29
+
+- 6.4 节补充「历史消息的 role 由上一回合盖好章、本轮只搬运」：`_build_loop_messages` 沿用历史条目原有 role，只做过滤+搬运，唯 `system` 压缩摘要加 header。证据 `agentic_pipeline.py:385-399`。
+- 6.4 节明确 `_build_loop_messages` 与 `_build_system_prompt` 是父子关系、面对同一份 `UnifiedContext`：总入口取历史与当前用户消息，子步骤取 capability/tools/记忆等料拼 system；成品写进 `messages` 不写回 `UnifiedContext`。
 
 ### 2026-07-28
 
