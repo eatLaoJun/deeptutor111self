@@ -527,11 +527,28 @@ Anthropic 后端通过适配器转换为 OpenAI Chat Completions 形态；Azure 
 
 设计上的一个重要细节：KB seed 等易变化内容放在最后一条 user message，而不是 system prompt。这样整个循环的 system prompt 保持字节稳定，更有利于 Provider 的前缀缓存。
 
+#### system prompt 的组装时机与位置
+
+每条用户回合都重新组装一份 system prompt，并不区分“第一次”或“往后”。
+
+- **跨回合**：每发一条用户消息进入 `AgentLoop.run()`，都会再调一次 `AgenticChatPipeline._build_loop_messages()`，其中 `_build_system_prompt()` 重新拼出整个 system 文本；历史由 `turn_runtime` 把上一回合存下的 `conversation_history` 装回 `UnifiedContext` 后一并注入。
+- **回合内的多轮 LLM 调用**：system prompt 不再重建。它作为 `messages[0]` 一直留在列表里，后续轮次只向列表追加 assistant（含 tool_calls）和 `role=tool` 消息。
+
+`messages[0]` 即 system，固定 role=system、位于列表第一条，由 `_build_loop_messages` 直接写入：
+
+```python
+messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+```
+
+因此一条 `[TRACE] 初始 messages 组装完成 | total=N` 里的 `N` 能反推本回合形态：新会话第一条消息时历史为空，`N = 2`（system + user）；续聊则有 `1 + 2k(历史) + 1 = 奇数`。
+
 证据：
 
-- `deeptutor/agents/chat/agentic_pipeline.py:345-386`
-- `deeptutor/agents/chat/prompt_blocks.py:19-93`
+- `deeptutor/agents/chat/agentic_pipeline.py:340`（`_build_system_prompt`）
+- `deeptutor/agents/chat/agentic_pipeline.py:360-401`（`_build_loop_messages`，写入 `messages[0]` 并遍历 `context.conversation_history`）
+- `deeptutor/agents/chat/prompt_blocks.py:19-93`（`ChatPromptAssembler.system_prompt` 拼装各块）
 - `deeptutor/agents/chat/prompts/zh/agentic_chat.yaml`
+- `deeptutor/services/session/turn_runtime.py:1616`（每回合把上一回合历史装回 `UnifiedContext`）
 
 ### 6.5 AgentLoop 核心算法
 
@@ -1165,6 +1182,7 @@ http://127.0.0.1:3782
 - 扩展 `UnifiedContext`：补充其请求包定位、字段职责、数据流和与会话存储/循环状态的区别。
 - 补充 Tool 完整调用链：区分源代码、运行时注册表、当前回合 schema 和对话消息，并说明工具如何交给 AgentLoop。
 - 为统一工具执行入口增加开始、成功和失败 TRACE，并对参数预览进行长度限制和敏感字段脱敏。
+- 在 6.4 节补充 system prompt 的组装时机与位置：每条用户回合重建一次 system，回合内多轮 LLM 复用同一条 `messages[0]`；由 `_build_loop_messages` 写入，历史由 `turn_runtime` 每回合装回 `UnifiedContext`。
 
 ### 2026-07-27
 
