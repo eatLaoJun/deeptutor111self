@@ -350,6 +350,12 @@ Capability 不直接依赖某个 UI，而是向 `StreamBus` 发出统一事件�
 
 这是一种“执行逻辑和展示方式解耦”的设计：能力只描述发生了什么，入口决定如何显示。
 
+StreamBus 的机制层可拆成三件套（实现细节在 `stream_bus.py`，第三阶段再核）：
+
+- **异步队列**：内部用一个先进先出的 `asyncio.Queue` 存事件；队列空了消费者挂起等待、满了 producer 挂起等待，不丢不挤。
+- **多订阅者**：`subscribe()` 给每个调用方返回各自独立的消费游标/副本，CLI/Web/SDK 同时订阅时各收各的同一份事件流。
+- **显式收尾标记**：producer（capability）一停，`finally` 里 `emit(DONE)` 发最后一条事件、`close()` 打「不会再有下一条」标记；消费者那侧的 `async for` 不是靠队列瞬时空判定结束，而是看到这个标记才退出。
+
 ## 6. 一次对话的主调用链
 
 **状态：已验证到默认 chat Agent Loop**
@@ -361,11 +367,19 @@ Capability 不直接依赖某个 UI，而是向 `StreamBus` 发出统一事件�
 3. 读取 `context.active_capability`；未指定时使用 `chat`。
 4. 从 `CapabilityRegistry` 获取 Capability 实例。
 5. 先产生一个 `SESSION` 事件。
+
+   第 5 步的细节：`SESSION` 由编排器**直接 `yield`** 给调用方，**不走 bus**（它在这一刻还没有 bus）。`handle()` 是个 async 生成器，`yield` 就是它的输出，所以 SESSION 与后面 capability 的内容流走**两条出口路径**——SESSION 直接 yield、bus 事件经 `async for event in bus.subscribe(): yield event` 转发。调用方看一条事件流分不出路径，唯一区别是时机：SESSION 永远在 bus 建好、capability 开跑之前的开场第一个。它携带 `session_id + turn_id`，是编排器的「回合开始」元信息，使命调用方第一时间拿到本轮身份证号。不分走 bus 的原因有二：SESSION 是编排器元信息而非 capability 业务流，混进 bus 会让 bus 职责变糊；且它能在 bus 这个对象还没建好的瞬间就发，调用方不必等 bus 起来。
+
 6. 为本回合创建 `StreamBus`。
 7. 在异步任务中执行 `capability.run(context, bus)`。
 8. 通过 `bus.subscribe()` 持续向调用方返回流式事件。
 9. 无论成功失败，最终产生 `DONE` 事件并关闭 Bus。
 10. 执行结束后向全局 EventBus 发布 `CAPABILITY_COMPLETE`。
+
+   第 10 步的关键：`EventBus` 是**另一条总线**，不要和 StreamBus 混。两条总线对照——StreamBus 是这次回合内的实时流，给 UI 看、回合结束就 close；EventBus 是项目级的长期公告板，进程生命周期挂着，给**不直接参与这次对话的监听者**（统计/记账、cron、memory 触发、生命周期钩子等）用。这些听众不需要实时事件流，只要「这个回合完成了」这一个里程碑信号——`_publish_completion` 就是往公告板上贴这张告示。它两个工程取舍值得记：**吞异常**（`publish` 失败只记 debug 日志、不影响回合结果），因为它是**公告不是命脉**——StreamBus 才是命脉（UI 全靠它），EventBus 发失败最坏是统计这次没收到；**放在 StreamBus 收尾之后**才发，保证公告时回合真的完整结束（不先公告再收尾，避免公告与实际状态不符）。证据 `orchestrator.py:96-114`。
+
+第 8、9 步背后的并发结构：`capability.run(context, bus)` 跑在后台任务里（`asyncio.create_task(_run())`），它边跑边向 bus 喊事件；主协程同时 `async for event in stream: yield event` 把事件一条条吐给调用方。`_run()` 用 `try/finally` 包住 `capability.run`：`finally` 里**先 `bus.emit(DONE)` 再 `bus.close()`**——`emit(DONE)` 发出最后一条会被消费的事件，`close()` 给订阅迭代器打上「不会再有下一条」标记。消费者那侧的 `async for` 能一直收，是因为 producer 在源源不断塞事件；它之所以会停，**不是因为队列瞬时空了一下**（空了只会挂起等下一条），**而是因为 `bus.close()` 那个结束标记**——吐完残留事件后迭代器见到「已关」，自然抛 `StopAsyncIteration` 退出。所以「发 DONE」「让流收尾」是两件不同的事：前者是事件，后者是管道状态，两者同在 `finally` 里发、互相配合。
+
 
 对应核心代码：
 
@@ -1206,6 +1220,10 @@ http://127.0.0.1:3782
 
 - 6.4 节补充「历史消息的 role 由上一回合盖好章、本轮只搬运」：`_build_loop_messages` 沿用历史条目原有 role，只做过滤+搬运，唯 `system` 压缩摘要加 header。证据 `agentic_pipeline.py:385-399`。
 - 6.4 节明确 `_build_loop_messages` 与 `_build_system_prompt` 是父子关系、面对同一份 `UnifiedContext`：总入口取历史与当前用户消息，子步骤取 capability/tools/记忆等料拼 system；成品写进 `messages` 不写回 `UnifiedContext`。
+- 第 6 章第 8/9 步补充「bus 收尾机制」：`capability.run` 跑在后台 task、主协程并发 `async for` 收事件；`finally` 里 `emit(DONE)` + `close()` 才让消费者循环退出——退出靠 `close()` 的结束标记，而非队列瞬时空。证据 `orchestrator.py:84-95`、`stream_bus.py`。
+- 5.4 节补充 StreamBus 机制三件套：异步队列（`asyncio.Queue`、空/满自动挂起）、多订阅者（各收各的副本）、显式收尾标记（`close()` 让 `async for` 退出而非靠队列自然空）。
+- 第 6 章第 5 步补 SESSION 机制：SESSION 由编排器直接 `yield` 给调用方、不走 bus（此刻 bus 未建），是「回合开始」元信息（session_id + turn_id）；它在 bus 建好、capability 开跑之前最早发。编排器元信息与 capability 业务流分两路：直接 yield vs 经 bus 转发。证据 `orchestrator.py:70-77`。
+- 第 6 章第 10 步补 EventBus 与 StreamBus 的区分：EventBus 是项目级长期公告板、给不在 UI 链路上的统计/钩子/cron/memory 用；`_publish_completion` 发 `CAPABILITY_COMPLETE` 是公告、非命脉（吞异常不影响回合），置于 StreamBus 收尾之后才发。证据 `orchestrator.py:96-114`。
 
 ### 2026-07-28
 

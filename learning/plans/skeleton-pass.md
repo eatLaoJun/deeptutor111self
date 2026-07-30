@@ -29,6 +29,7 @@
 - 只看：UnifiedContext 有哪些字段、StreamBus 有哪些方法名
 - 产出：能讲这句话——“一条消息进来先被打成一个统一上下文,能力只往总线发事件,不直接碰 UI”
 - 完成：`daily-points-queue.md` 第 1 晚打勾
+- 状态：✅ 已完成（2026-07-28/29，UnifiedContext=原料筐、StreamBus=不存储只发事件）
 
 ### 第 2 晚：编排器选能力
 
@@ -36,6 +37,10 @@
 - 只看：`ChatOrchestrator.handle()` 那 10 步、chat 入口链
 - 产出：能讲——“编排器选能力、起 bus、跑 capability、最后发 DONE”
 - 完成：打勾
+- 状态：✅ 已完成（2026-07-29，10 步细到机制层：并发、close 收尾、SESSION 不走 bus、EventBus≠StreamBus）
+
+> 备注：`EventBus` / `_publish_completion` 这条目前**只用知道「它是一条独立的项目级公告板、非命脉、吞异常」**就行，**第三阶段不用核**。它在骨架里只是第 10 步的一个收尾符号，钻进去属于偏题。等第三阶段啃完后、对项目全貌有兴趣时再回来看 `event_bus` 的订阅者都有谁。
+
 
 ### 第 3 晚：单个循环
 
