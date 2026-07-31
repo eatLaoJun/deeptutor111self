@@ -371,6 +371,10 @@ StreamBus 的机制层可拆成三件套（实现细节在 `stream_bus.py`，第
    第 5 步的细节：`SESSION` 由编排器**直接 `yield`** 给调用方，**不走 bus**（它在这一刻还没有 bus）。`handle()` 是个 async 生成器，`yield` 就是它的输出，所以 SESSION 与后面 capability 的内容流走**两条出口路径**——SESSION 直接 yield、bus 事件经 `async for event in bus.subscribe(): yield event` 转发。调用方看一条事件流分不出路径，唯一区别是时机：SESSION 永远在 bus 建好、capability 开跑之前的开场第一个。它携带 `session_id + turn_id`，是编排器的「回合开始」元信息，使命调用方第一时间拿到本轮身份证号。不分走 bus 的原因有二：SESSION 是编排器元信息而非 capability 业务流，混进 bus 会让 bus 职责变糊；且它能在 bus 这个对象还没建好的瞬间就发，调用方不必等 bus 起来。
 
 6. 为本回合创建 `StreamBus`。
+
+   第 6 步的子动作：建好 bus 后，若有 `turn_id`，`register_bus(turn_id, bus)` 把这个回合的 bus 挂进一张进程级全局表（turn_id → bus）。它的作用是**让别处能按 turn_id 找回本次回合的 bus 对象**——尤其 ask_user 暂停恢复：用户按下 `submit_user_reply` 起的新请求手里只有 turn_id 字符串，没有旧 bus 引用，必须能从全局表定位到正在暂停的那个回合、把回答塞回同一个 bus，让暂停的 `_run_loop` 继续下一轮（见 6.9）。
+回合结束的 `finally` 里再 `unregister_bus(turn_id)` 把它从全局表摘掉，防内存泄漏。铁序：register 必须在 `create_task` 跑 capability 之前，否则 capability 跑到一半时需要被别处找回的请求就晚了。证据 `orchestrator.py:79-82`、`stream_bus.py`（register_bus/unregister_bus）。
+
 7. 在异步任务中执行 `capability.run(context, bus)`。
 8. 通过 `bus.subscribe()` 持续向调用方返回流式事件。
 9. 无论成功失败，最终产生 `DONE` 事件并关闭 Bus。
@@ -1167,7 +1171,12 @@ http://127.0.0.1:3782
 | Registry | 注册、发现和获取 Tool/Capability 的目录 |
 | UnifiedContext | 在不同入口和能力之间传递的统一回合上下文 |
 | StreamEvent | 与具体 UI 无关的流式输出事件 |
-| StreamBus | Capability 发布、消费者订阅 StreamEvent 的异步总线 |
+| StreamBus | Capability 发布、消费者订阅 StreamEvent 的异步总线；回合内活、回合结束 close |
+| EventBus | 项目级长期公告板（区别于回合内 StreamBus）；回合结束发 `CAPABILITY_COMPLETE` 给非 UI 监听者（统计/钩子/cron），非命脉、吞异常 |
+| session | 一次连续对话的关系，跨多个回合；标识为 `session_id` |
+| turn | 一次「用户发消息 → AI 答」的回合；同 session 内多个 turn 各有 `turn_id`。ask_user 暂停恢复属于同一 turn、不开新 turn |
+| session_id | 标识「哪一段会话」，长期关系 |
+| turn_id | 标识「会话内第几回合」，被 `register_bus` 用作 key 让别处能按它找回当前回合的 bus |
 | RAG | 先从知识库检索相关内容，再让模型基于内容生成回答 |
 | Mount | 在当前上下文中把某个 Tool 暴露给 LLM |
 | Narration | 调用工具的 LLM 轮次中，展示给用户的简短前导文本 |
@@ -1215,6 +1224,11 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-07-30
+
+- 第 6 章第 6 步补 `register_bus` 子动作：建好 bus 后把 turn_id → bus 挂全局表，让 ask_user 暂停恢复等「中途找回本次回合 bus」的请求能按 turn_id 定位；回合结束 `unregister_bus` 摘掉防泄漏。铁序在 `create_task` 之前。证据 `orchestrator.py:79-82`、`stream_bus.py`。
+- 第 11 章术语表补 session/turn/session_id/turn_id 条目：session 是长期关系、turn 是单次发答、ask_user 暂停恢复同 turn 不开新 turn、turn_id 是 `register_bus` 的查找 key；并补 EventBus 条目（区别于 StreamBus）。
 
 ### 2026-07-29
 
