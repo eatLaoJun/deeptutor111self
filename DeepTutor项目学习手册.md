@@ -6,7 +6,7 @@
 >
 > 使用方式：既可以直接阅读，也可以把本文档交给 GPT，在语音通话中按章节讲解和提问。
 >
-> 当前基线：`main` 分支，提交 `c5195899`，最后更新于 2026-07-28。
+> 当前基线：`main` 分支，提交 `d90ce8f8`，最后更新于 2026-08-03。
 
 ## 目录
 
@@ -708,6 +708,30 @@ tool_choice = "auto"
 8. 为每个 call 生成标准 OpenAI 协议的 `role=tool` 消息。
 9. 聚合 sources、pause 和 terminate 信号。
 
+这里的 `DispatchOutcome` 不是某一个工具的返回值，而是
+`dispatch_tool_calls()` 对“这一批并行工具执行结果”的汇总信封。它主要携带：
+
+- `tool_messages`：每个工具对应的标准 `role=tool` 消息，追加回 AgentLoop 的
+  `messages`，供下一轮 LLM 读取。
+- `sources`：这一批工具产生的引用来源。
+- `tool_metadata_by_id`：按 `tool_call_id` 保存的结构化元数据。
+- `pause` / `pause_payload` / `pause_tool_call_id`：某个工具要求暂停并等待用户输入。
+- `terminate` / `terminate_payload`：某个工具要求本回合立即结束，并把其内容作为
+  最终产物。
+
+普通工具的两个控制信号都为假，AgentLoop 会自然进入下一轮。`pause` 和
+`terminate` 的区别是：
+
+- `pause` 是“同一回合暂时挂起”。当前使用者是 `ask_user`；收到回答后，运行时把
+  回答替换进对应的 `role=tool` 消息，再继续下一轮 LLM。
+- `terminate` 是“同一回合已经有最终产物，立即结束”。不会再调用 LLM；当前内置
+  Chat 工具没有实际使用它，它是为真正的终止型工具保留的协议能力。
+
+聚合时分别采用第一个 `pause` 和第一个 `terminate` 请求；但在 AgentLoop 层
+`pause` 优先处理，因此发生暂停时不会立即发出终止结果。证据：
+`deeptutor/core/agentic/tool_dispatch.py:61-81,492-573`、
+`deeptutor/agents/chat/agent_loop.py:346-414`。
+
 服务端参数注入很重要。模型只提供业务参数，运行时负责补充它不应该控制的内容，例如：
 
 - `rag` 默认 `mode=hybrid`。
@@ -791,6 +815,23 @@ MCP 工具默认不把完整 schema 全部塞进模型上下文：
 ```
 
 Agent Loop 收到后，会删除 checkpoint 边界之后积累的 narration 和原始 tool results，改为一条 `[Context checkpoint]` system 摘要。后续 checkpoint 会保留之前的摘要并继续追加。
+
+`checkpoint_boundary` 就是当前 `messages` 列表里的一个整数下标，表示“这个位置之前的
+消息已经是必须保留的稳定前缀”。它在循环开始时等于初始 messages 的长度，因此
+system、历史消息和当前用户消息不会被 checkpoint 删除。工具返回新摘要后，循环执行：
+
+```python
+prefix = messages[:checkpoint_boundary]
+prefix.append({"role": "system", "content": checkpoint_summary})
+messages[:] = prefix
+checkpoint_boundary = len(messages)
+```
+
+因此每次 checkpoint 都会删除“上一个边界之后”刚积累的 assistant narration、
+tool calls 和原始 `role=tool` 结果，只留下工具提供的短摘要；新的边界又包含旧摘要，
+所以后续 checkpoint 会在保留已有摘要的基础上继续压缩。这个变量只服务于当前
+AgentLoop 的内存消息列表，不是数据库事务 checkpoint，也不是持久化进度游标。
+证据：`deeptutor/agents/chat/agent_loop.py:190-205,396-441,769-780`。
 
 它和普通窗口裁剪的区别：
 
@@ -1224,6 +1265,14 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-03
+
+- 6.7 节补充 `DispatchOutcome` 的聚合信封定位和字段职责，明确普通继续、
+  `pause` 同回合等待并恢复、`terminate` 直接结束回合三种控制结果，以及
+  AgentLoop 中 `pause` 优先于 `terminate` 的处理顺序。
+- 6.8 节解释 `checkpoint_boundary` 是当前 messages 的稳定前缀下标，补充其初始化、
+  裁剪、追加 checkpoint 摘要和更新边界的完整过程，并明确它不是持久化进度游标。
 
 ### 2026-07-30
 
