@@ -356,6 +356,16 @@ StreamBus 的机制层可拆成三件套（实现细节在 `stream_bus.py`，第
 - **多订阅者**：`subscribe()` 给每个调用方返回各自独立的消费游标/副本，CLI/Web/SDK 同时订阅时各收各的同一份事件流。
 - **显式收尾标记**：producer（capability）一停，`finally` 里 `emit(DONE)` 发最后一条事件、`close()` 打「不会再有下一条」标记；消费者那侧的 `async for` 不是靠队列瞬时空判定结束，而是看到这个标记才退出。
 
+**关于 `_bus_registry`（模块级全局查找表，不是单例）**
+
+`stream_bus.py` 末尾有一个模块级变量 `_bus_registry: dict[str, StreamBus] = {}`，外加 `register_bus / unregister_bus / get_bus` 三个函数。它和 `class StreamBus` 是**同一文件、同一模块层级的两个独立名称**——`_bus_registry` 不是 `StreamBus` 的类属性。
+
+- **是全局变量**：定义在模块顶层，Python 模块只会被 import 一次，所有引用 `stream_bus` 的代码共享同一个 dict 对象。
+- **不是单例模式**：单例指「某个类只能有一个实例」，而这里的 `StreamBus` 在每个回合都 `new` 一个，注册表里同时挂着**多个** StreamBus 实例（一个 turn_id 对应一个）。真正「全局唯一」的是那张 dict 容器本身，不是 StreamBus 实例。
+- **准确定性**：这是 Service Locator / Registry 模式——用模块级全局变量做一张「按 key 找服务实例」的查找表，对象本身可多例注册进去。下划线前缀只是「模块内部用」的 Python 惯例。
+
+它与 5.4 三件套的关系：三件套讲的是**单个 bus 实例内部**如何扇出事件；`_bus_registry` 讲的是**多个 bus 实例之间**如何被外部按 turn_id 找回（尤其 ask_user 暂停恢复要用，见 6.9）。证据 `stream_bus.py:308-325`。
+
 ## 6. 一次对话的主调用链
 
 **状态：已验证到默认 chat Agent Loop**

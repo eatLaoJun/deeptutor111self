@@ -44,6 +44,21 @@
 
 ## 阶段二：候选（阶段一吃完再排）
 
+> 📌 **简历素材候选（回头深挖）**：`solve_finish_step` 的 `_context_checkpoint` 折叠机制。
+> 全仓只有这一个工具会触发，是"工具主动声明阶段性完成 + 循环自动折叠上下文为递增摘要"的设计。
+> 已在骨架速通时掠过，留作后面专门一晚深挖，目标写进简历讲"多步工具调用如何不爆上下文"。
+> 证据：`agent_loop.py:396-441,769-780` + `solve/tools.py:11-14,198-203`，详见 memory 里 [[solve-checkpoint-resume-poi]]。
+
+> 📌 **Tool / Skill 调用机制（回头深挖，简历素材候选）**：用户问"tool 是怎么调用、skill 怎么影响 agent"。
+> 这块比 checkpoint 大，跨 4 个目录：
+> - 工具注册表 `runtime/registry/tool_registry.py:21-157`（register / get_definitions / build_openai_schemas / deferred_tools）
+> - 工具分发执行 `core/agentic/tool_dispatch.py`（dispatch_tool_calls_in_parallel）
+> - Skill 制品（不是工具）`services/skill/` + 前端 `web/lib/skills-api.ts`（影响可用工具/提示词/系统消息）
+> - 外部工具经 MCP：`services/mcp/manager.py`
+> 与阶段一队列第 6 点（ToolDefinition → OpenAI schema）同源，但本条范围更宽：从注册到执行到 skill 注入一整链。
+> 深挖次序建议：①tool_registry 怎么把工具暴露给 LLM → ②tool_dispatch 怎么并行执行回填 → ③skill 怎么改变可用工具集与提示 → ④MCP 外部工具怎么接入。
+> 顺带核对手册第 5.2 节是否已覆盖，缺则补。
+
 - [ ] RAG 从文档解析到检索返回的完整链路（手册待验证项）
 - [ ] Deep Research 多阶段流程
 - [ ] Memory / Skill / Source 注入顺序
