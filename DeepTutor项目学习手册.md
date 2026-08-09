@@ -6,7 +6,7 @@
 >
 > 使用方式：既可以直接阅读，也可以把本文档交给 GPT，在语音通话中按章节讲解和提问。
 >
-> 当前基线：`main` 分支，提交 `d90ce8f8`，最后更新于 2026-08-03。
+> 当前基线：`main` 分支，提交 `d90ce8f8`，最后更新于 2026-08-09。
 
 ## 目录
 
@@ -316,6 +316,47 @@ BUILTIN_TOOL_TYPES
 模型根据 schema 产生工具名和 JSON 参数；服务端再按工具名回到
 `ToolRegistry._tools` 查找实例并执行。
 
+#### 真实案例：`brainstorm` 如何跑完一轮
+
+`BrainstormTool` 是一个完整但链路较短的内置 Tool：
+
+1. `BrainstormTool.get_definition()` 声明工具名 `brainstorm`，并定义必填
+   `topic` 和可选 `context` 两个字符串参数。
+2. `BrainstormTool` 被列在 `BUILTIN_TOOL_TYPES` 中；
+   `ToolRegistry.load_builtins()` 实例化并注册它。
+3. 当用户为当前回合启用 `brainstorm` 后，
+   `_compose_enabled_tools()` 保留该名称，`build_openai_schemas()` 再把
+   `ToolDefinition` 变成模型可见的 function schema。模型看到的是
+   工具名、说明、参数类型和 `required=["topic"]`，而不是 Python 代码。
+4. 如果外层 Chat LLM 返回
+   `brainstorm({"topic": "Agent 学习路线", "context": "面试准备"})`，
+   `AgentLoop` 会先保存 assistant 的 tool call，再交给
+   `dispatch_tool_calls()`。
+5. Dispatcher 解析 JSON 参数并调用
+   `execute_tool_call() -> ToolRegistry.execute() -> BrainstormTool.execute()`。
+6. `BrainstormTool.execute()` 继续调用
+   `deeptutor.tools.brainstorm.brainstorm()`。该函数使用自己的头脑风暴
+   system prompt 执行**一次独立 LLM 调用**，它不会再进入一个新的
+   AgentLoop。
+7. 内层 LLM 的文本被包装为 `ToolResult.content`；dispatcher 再将其转为
+   包含原 `tool_call_id` 的 `role=tool` 消息，追加回外层 Chat
+   `messages`，下一轮外层 LLM 读取该结果并组织最终答案。
+
+因此这个案例中有两次职责不同的模型调用：**外层 Chat LLM
+做工具决策和最终回答，内层 Brainstorm LLM 只做发散生成**。
+
+关键证据：
+
+- `deeptutor/core/tool_protocol.py:16-94,170-217`
+- `deeptutor/tools/builtin/__init__.py:42-74,1442-1447`
+- `deeptutor/runtime/registry/tool_registry.py:36-59,93-151`
+- `deeptutor/agents/chat/agentic_pipeline.py:302-335,536-569,643-648`
+- `deeptutor/agents/chat/agent_loop.py:269-363`
+- `deeptutor/core/agentic/tool_dispatch.py:84-190,337-467,516-548`
+- `deeptutor/tools/brainstorm.py:45-104`
+- `tests/core/test_builtin_tools.py::test_brainstorm_tool_passes_llm_arguments`
+- `tests/agents/chat/test_agent_loop.py::test_tool_round_then_finish`
+
 Deferred MCP 工具还有一层会话级记录：
 `deeptutor/services/mcp/session_state.py` 会把已经动态加载的**工具名称**
 保存到当前 chat session 工作区的 `loaded_tools.json`。这里持久化的仍然只是
@@ -365,6 +406,68 @@ StreamBus 的机制层可拆成三件套（实现细节在 `stream_bus.py`，第
 - **准确定性**：这是 Service Locator / Registry 模式——用模块级全局变量做一张「按 key 找服务实例」的查找表，对象本身可多例注册进去。下划线前缀只是「模块内部用」的 Python 惯例。
 
 它与 5.4 三件套的关系：三件套讲的是**单个 bus 实例内部**如何扇出事件；`_bus_registry` 讲的是**多个 bus 实例之间**如何被外部按 turn_id 找回（尤其 ask_user 暂停恢复要用，见 6.9）。证据 `stream_bus.py:308-325`。
+
+### 5.5 Skill
+
+**状态：已验证到存储、Manifest 组装和按需加载**
+
+Skill 是供模型按任务需要查阅的流程包，不是可直接执行的
+Tool。每个 Skill 以目录为单位，核心文件是 `SKILL.md`，还可携带
+`references/` 等附属资源。
+
+运行时有两层来源：
+
+- 内置 Skill：`deeptutor/skills/builtin/`，运行时只读。
+- 用户 Skill：当前用户 workspace 的 `skills/` 目录；同名时覆盖内置 Skill。
+
+普通 Skill 不会把全文都塞进 System Prompt。`SkillService.summary_entries()`
+先生成名称、说明和可用状态等 Manifest，`turn_runtime` 将它写入
+`UnifiedContext.skills_manifest`。Chat 看到有 Skill 后自动挂载 `read_skill`
+Tool；模型匹配到任务时，再调用 `read_skill` 读取完整 `SKILL.md`
+或附属文件。只有标记 `always: true` 且当前可用的 Skill 会被提前
+全文注入。
+
+`read_skill_file()` 拒绝绝对路径和 `..` 路径穿越，并限制单次返回文本
+长度；因此 Skill 的核心取舍是**先给目录，命中后再读全文**，以减少
+无关上下文占用。
+
+关键证据：
+
+- `deeptutor/services/skill/service.py:1-46,215-254,408-520,993-1022`
+- `deeptutor/services/session/turn_runtime.py:1375-1412,1625`
+- `deeptutor/agents/chat/agentic_pipeline.py:536-569`
+- `deeptutor/tools/builtin/__init__.py:1203-1276`
+
+### 5.6 三层记忆
+
+**状态：已验证到存储结构、归并入口和 Chat 注入**
+
+记忆模块以当前用户的 memory root 为隔离边界，数据分三层：
+
+| 层级 | 存储 | 职责 |
+| --- | --- | --- |
+| L1 | `trace/<surface>/<YYYY-MM-DD>.jsonl` | 按场景追加原始事件 |
+| L2 | `L2/<surface>.md` | 将单一场景的 L1 事件归并为带来源引用的结构化记忆 |
+| L3 | `L3/<recent\|profile\|scope\|preferences>.md` | 跨场景聚合近期状态、画像、范围与偏好 |
+
+L2 场景定义为 `chat`、`notebook`、`quiz`、`kb`、`book`、`partner`、
+`cowriter`。`MemoryStore` 是公共门面：`emit()` 写 L1，`update_l2()` 交给
+consolidator 执行 L1 到 L2 归并，`update_l3()` 执行 L2 到 L3 聚合，并支持
+预览操作后的原子应用。`preferences` 不走自动 L3 归并，由 `write_memory`
+Tool 写入。
+
+当回合选择了 memory references 时，`turn_runtime` 通过
+`MemoryStore.read_l3_concat()` 读取四个 L3 文档，写入
+`UnifiedContext.memory_context`；Chat 的 Prompt 组装再把它作为 Memory 块注入
+System Prompt。
+
+关键证据：
+
+- `deeptutor/services/memory/__init__.py`
+- `deeptutor/services/memory/paths.py:1-89`
+- `deeptutor/services/memory/store.py:47-216`
+- `deeptutor/services/session/turn_runtime.py:1364,1616-1625`
+- `deeptutor/agents/chat/prompt_blocks.py:71-72`
 
 ## 6. 一次对话的主调用链
 
@@ -1275,6 +1378,19 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-09
+
+- 5.5 节增加 Skill 存储、用户覆盖内置、Manifest 注入、`read_skill`
+  按需读取及 `always` 预加载链路。
+- 5.6 节增加三层记忆的 L1/L2/L3 存储结构、场景列表、
+  `MemoryStore` 归并入口以及 L3 记忆注入 Chat System Prompt 的实际路径。
+
+### 2026-08-07
+
+- 5.2 节增加 `brainstorm` 真实 Tool 案例，串联定义、注册、Schema、
+  外层 tool call、分发、内层单次 LLM 调用和 `role=tool` 回填，并区分
+  外层 Chat LLM 与内层 Brainstorm LLM 的职责。
 
 ### 2026-08-03
 

@@ -32,10 +32,13 @@
   - 要回答：超 90% 窗口时从什么 role 的消息开始裁？替换成什么占位文本？裁到多少为止？
   - 输出：手册 6.13 补一句
 
-- [ ] **第 6 点：一个 Tool 怎么从 ToolDefinition 变成 OpenAI function schema**
+- [x] **第 6 点：一个 Tool 怎么从 ToolDefinition 变成 OpenAI function schema**
   - 切口：`deeptutor/runtime/registry/tool_registry.py` `build_openai_schemas`
   - 要回答：一行 ToolDefinition 经哪几步变成传给 LLM 的 `tools=[...]`？参数描述从哪来？
   - 输出：补进手册 5.2 或第六章相关位置
+  - 结论（2026-08-07）：用 `brainstorm` 实例验证
+    `ToolDefinition -> ToolRegistry.build_openai_schemas() -> tools=[...]`，
+    参数说明来自 `ToolParameter`；完整案例已写入手册 5.2 节。
 
 - [ ] **第 7 点：WebSocket 入口怎么把前端消息变成 UnifiedContext**
   - 切口：`deeptutor/api/routers/unified_ws.py` + `deeptutor/services/session/turn_runtime.py:1616` 附近
