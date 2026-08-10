@@ -56,3 +56,44 @@ WebSocket 收到 start_turn
 
 CLI 和 Python SDK 先经过 `DeepTutorApp.start_turn()`，之后也进入同一个
 `TurnRuntimeManager.start_turn()`。
+
+## WebSocket、SSE 和 `done`
+
+- HTTPS 是加密的 HTTP；WebSocket 的加密版本是 `wss://`，所以 HTTPS 和
+  WebSocket 不是互斥选项。
+- SSE 是服务端到客户端的单向 HTTP 事件流；WebSocket 是客户端与服务端双向通信。
+- DeepTutor 的 `done` 只表示当前 turn 完成，不是 WebSocket 协议的关闭帧。
+- 后端发送 `done` 后仍可继续接收消息；当前 Web 前端为了接收尾随的
+  `session_meta`，会等待 15 秒后主动 `disconnect()`。
+
+记忆句：**WebSocket 是通话线路，turn 是一次发言，`done` 是“这次发言说完了”，
+不等于线路在协议层自动挂断。**
+
+当前 Web 前端是按需连接：发送消息等动作调用 `sendThroughRunner()` 时才连接；打开
+普通历史会话不会自动保持 WebSocket，只有发现 active turn 时才连接并订阅恢复。主动
+取消、组件卸载、流超时和 `done` 后 15 秒清理会断开；意外掉线最多自动重连 5 次。
+
+不要混淆三个生命周期：
+
+```text
+WebSocket     = 浏览器和后端之间的双向线路
+turn          = 在线路上执行的一次问答任务
+subscribe_turn = 把某个 turn 的事件转发到线路的订阅
+```
+
+后端的 WebSocket 主循环负责继续接收 `cancel_turn`、`submit_user_reply` 等消息；另一个
+`_forward()` 后台任务负责向浏览器发送当前 turn 的事件。`done` 让 turn 和订阅收尾，
+不直接终止主接收循环。
+
+## 为什么 Runtime 固定调用 `ChatOrchestrator`
+
+`ChatOrchestrator` 的名字有历史误导性，它实际是所有 Capability 的统一路由器：
+
+```text
+context.active_capability = chat       -> ChatCapability
+context.active_capability = deep_solve -> DeepSolveCapability
+context.active_capability = visualize  -> VisualizeCapability
+```
+
+`TurnRuntimeManager` 负责准备和管理 turn，`ChatOrchestrator` 负责根据名称从
+`CapabilityRegistry` 选择能力；项目不是“一种 Capability 配一个 Orchestrator”。

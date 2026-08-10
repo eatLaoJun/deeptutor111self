@@ -185,6 +185,48 @@ ToolRegistry    CapabilityRegistry
 3. Registry 负责发现和获取 Tool/Capability，不让编排器硬编码所有实现。
 4. `StreamBus` 统一输出进度、内容、错误和完成事件。
 
+### 4.1 WebSocket、SSE 与 `done` 的边界
+
+**状态：已验证**
+
+HTTPS 表示“加密的 HTTP”，WebSocket 表示一种全双工通信协议，两者不是同一维度的
+反义概念。浏览器访问 HTTPS 页面时，通常使用加密的 `wss://` WebSocket。普通 HTTP
+请求即使复用了底层 TCP 连接，应用层仍主要按“一次请求、一次响应”工作；WebSocket
+握手成功后，同一条逻辑连接上客户端和服务端都可以随时发送多条消息。
+
+SSE 也是基于 HTTP 的长时间流式响应，但主要是服务端向客户端单向推送；客户端需要
+向服务端提交新数据时，通常还要另发 HTTP 请求。WebSocket 则是双向的，所以本项目能
+在同一入口上既接收 `start_turn`、`submit_user_reply`、`cancel_turn`，又持续向前端推送
+模型事件。
+
+`done` 是 DeepTutor 自定义的“当前 turn 已结束”业务事件，不是 WebSocket 协议的关闭
+帧。后端 `/api/v1/ws` 在发送完某个 turn 的 `done` 后仍停留在
+`while not closed: await ws.receive_text()`，连接真正结束的条件是断开、异常或显式关闭。
+当前 Web 前端收到 `done` 后先把界面标为流结束，为等待标题等 `session_meta` 尾随事件，
+再延迟 15 秒调用 `disconnect()`。所以准确说法是：**`done` 结束一次回合的事件流；当前
+前端策略随后关闭连接，但不是 `done` 在协议层直接关掉连接。**
+
+当前前端采用按需连接，而不是“进入对话页就永久连接”：`UnifiedChatProvider` 挂载时只
+准备 runner 容器；发送消息、重新生成、提交 `ask_user` 回答等动作经过
+`sendThroughRunner()`，才由 `ensureRunner()` 创建并连接 `UnifiedWSClient`。打开历史会话
+主要先走 HTTP 加载；只有服务端报告该会话仍有 active turn 时，前端才建立 WebSocket 并
+发送 `subscribe_turn` 恢复事件流。主动取消、页面 Provider 卸载、客户端流超时以及
+`done` 后的延迟清理都会断开连接；非主动掉线则最多按指数退避重连 5 次，并通过
+`resume_from` 续接原 turn。
+
+理解运行时必须分开三种生命周期：WebSocket 是浏览器与后端之间的双向“线路”，turn 是
+线路上传输的一次任务，`subscribe_turn` 是把该任务事件转发到这条线路的订阅。后端收到
+`start_turn` 后，主协程仍在 `receive_text()` 等待取消或用户补充输入，同时另建
+`_forward()` 后台任务，把 `runtime.subscribe_turn()` 产生的事件用 `send_text()` 推回
+浏览器。turn 完成时订阅队列收到结束哨兵并停止 `_forward()`，但 WebSocket 主接收循环
+仍可继续。因此 turn、订阅和连接可以先后结束，三者不是同一个对象。
+
+关键证据：
+
+- `deeptutor/api/routers/unified_ws.py:44-68,79-104,113-133,314-324`
+- `web/lib/unified-ws.ts:157-250`
+- `web/context/UnifiedChatContext.tsx:718,940-952,1045-1068,1129-1212,1214-1257,1482-1533,1538-1555`
+
 ## 5. 核心概念
 
 ### 5.1 UnifiedContext
@@ -500,6 +542,14 @@ async for event in orch.handle(context):
 `deeptutor/api/routers/unified_ws.py:113-133`、
 `deeptutor/app/facade.py:114-125`、
 `deeptutor/services/session/turn_runtime.py:668-836,1155,1613-1663`。
+
+名字容易误导：`ChatOrchestrator` 并不只运行 `ChatCapability`。它读取
+`context.active_capability`，默认值才是 `chat`；例如传入 `deep_solve` 时，同一个
+Orchestrator 会从 `CapabilityRegistry` 取出 `DeepSolveCapability`。因此它在架构上的
+真实角色更接近“统一 Capability/Turn Orchestrator”。`TurnRuntimeManager` 负责回合记录、
+上下文装配和订阅生命周期，随后固定交给这个统一路由器；各能力的差异由 Capability
+多态实现，而不是为每种能力再建立一个 Orchestrator。内置映射见
+`deeptutor/runtime/bootstrap/builtin_capabilities.py`。
 
 `ChatOrchestrator.handle()` 当前已确认的流程：
 
@@ -1412,6 +1462,12 @@ http://127.0.0.1:3782
 - 第 4、6 章补充入口到 `ChatOrchestrator` 的真实调用方：CLI/SDK 通过
   `DeepTutorApp`，WebSocket 直接进入 `TurnRuntimeManager`，最终由
   `_run_turn()` 构造 `UnifiedContext` 并调用 `ChatOrchestrator.handle()`。
+- 4.1 节区分 HTTPS、WebSocket 与 SSE，明确 `done` 是 turn 级业务完成事件而非
+  WebSocket 关闭帧；补充前端按回合需要懒连接、active turn 恢复、断开与重连条件，
+  区分 WebSocket/turn/订阅三个生命周期，并记录当前前端为接收尾随
+  `session_meta` 而延迟 15 秒断开连接。
+- 第 6 章澄清 `ChatOrchestrator` 的名字不代表只运行 Chat：它是所有内置
+  Capability 的统一路由器，默认分支才是 `ChatCapability`。
 
 ### 2026-08-09
 
