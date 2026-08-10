@@ -144,10 +144,18 @@ data/user/settings/
 **状态：已验证**
 
 ```text
-CLI / WebSocket API / Python SDK
-              |
-              v
-      UnifiedContext
+CLI / Python SDK                 WebSocket API
+        |                              |
+        v                              v
+DeepTutorApp.start_turn()   TurnRuntimeManager.start_turn()
+        |                              |
+        +--------------+---------------+
+                       |
+                       v
+          TurnRuntimeManager._run_turn()
+                       |
+                       v
+               UnifiedContext
               |
               v
       ChatOrchestrator
@@ -171,7 +179,8 @@ ToolRegistry    CapabilityRegistry
 
 理解这张图时要抓住四点：
 
-1. `UnifiedContext` 统一不同入口传入的数据。
+1. CLI 和 Python SDK 先经过 `DeepTutorApp.start_turn()`；WebSocket 直接调用
+   `TurnRuntimeManager.start_turn()`，最终都由 `_run_turn()` 构造 `UnifiedContext`。
 2. `ChatOrchestrator` 决定本回合交给哪个 Capability。
 3. Registry 负责发现和获取 Tool/Capability，不让编排器硬编码所有实现。
 4. `StreamBus` 统一输出进度、内容、错误和完成事件。
@@ -472,6 +481,25 @@ System Prompt。
 ## 6. 一次对话的主调用链
 
 **状态：已验证到默认 chat Agent Loop**
+
+先回答“谁调用 `ChatOrchestrator`”：标准 CLI、WebSocket 和 Python SDK
+入口不会直接把原始请求交给它，而是先汇合到 `TurnRuntimeManager`。WebSocket
+收到 `message` / `start_turn` 后调用 `runtime.start_turn(msg)`；CLI 和 Python SDK
+通过 `DeepTutorApp.start_turn()` 调用同一个 Runtime。`start_turn()` 建立回合并启动
+`_run_turn()` 后台任务，后者装配历史、Memory、Skill、附件等数据，构造
+`UnifiedContext`，然后执行：
+
+```text
+orch = ChatOrchestrator()
+async for event in orch.handle(context):
+    ...
+```
+
+因此 `ChatOrchestrator` 位于“入口和会话运行时已经准备好本回合数据”之后、
+“选择并运行具体 Capability”之前。证据：
+`deeptutor/api/routers/unified_ws.py:113-133`、
+`deeptutor/app/facade.py:114-125`、
+`deeptutor/services/session/turn_runtime.py:668-836,1155,1613-1663`。
 
 `ChatOrchestrator.handle()` 当前已确认的流程：
 
@@ -1378,6 +1406,12 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-10
+
+- 第 4、6 章补充入口到 `ChatOrchestrator` 的真实调用方：CLI/SDK 通过
+  `DeepTutorApp`，WebSocket 直接进入 `TurnRuntimeManager`，最终由
+  `_run_turn()` 构造 `UnifiedContext` 并调用 `ChatOrchestrator.handle()`。
 
 ### 2026-08-09
 
