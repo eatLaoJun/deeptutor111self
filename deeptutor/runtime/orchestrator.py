@@ -24,7 +24,7 @@ from deeptutor.runtime.registry.tool_registry import get_tool_registry
 logger = logging.getLogger(__name__)
 
 
-class :
+class ChatOrchestrator:
     """
     Routes a ``UnifiedContext`` to the correct capability, manages
     the ``StreamBus`` lifecycle, and publishes completion events.
