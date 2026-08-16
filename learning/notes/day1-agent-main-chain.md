@@ -57,6 +57,25 @@ WebSocket 收到 start_turn
 CLI 和 Python SDK 先经过 `DeepTutorApp.start_turn()`，之后也进入同一个
 `TurnRuntimeManager.start_turn()`。
 
+## `ChatOrchestrator` 与 `ChatCapability` 口述版
+
+> 用户发起一次对话后，请求会先进入 `TurnRuntimeManager`。它负责创建回合，
+> 收集历史消息、Memory、Skill 和附件等数据，并组装成 `UnifiedContext`。
+> 数据准备完成后，由 `ChatOrchestrator.handle()` 统一调度。Orchestrator 根据
+> `active_capability` 从 `CapabilityRegistry` 取得对应能力，没有指定时默认选择
+> `chat`，同时管理本回合的 `StreamBus` 和流式事件生命周期。如果选中的是
+> `chat`，就调用 `ChatCapability.run()`。`ChatCapability` 是一个很薄的 Chat
+> 入口，它不负责路由和模型循环，只负责创建 `AgenticChatPipeline` 并继续下放。
+> Pipeline 再组装工具、Prompt 和模型客户端，最后创建 `AgentLoop` 执行多轮
+> LLM 与工具调用。
+
+一句话区分：
+
+```text
+ChatOrchestrator：选择谁处理，并管理回合事件流。
+ChatCapability：接住 chat 请求，并把它交给 Chat Pipeline。
+```
+
 ## WebSocket、SSE 和 `done`
 
 - HTTPS 是加密的 HTTP；WebSocket 的加密版本是 `wss://`，所以 HTTPS 和
