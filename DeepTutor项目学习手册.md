@@ -995,6 +995,11 @@ MCP 工具默认不把完整 schema 全部塞进模型上下文：
 
 #### Context Checkpoint
 
+先区分三个层级：一个 session 可以包含多个用户回合；一次用户回合启动一个
+AgentLoop；一个 AgentLoop 内部又可能执行多轮 LLM round。Context Checkpoint
+压缩的是**同一次用户回合内，上一个 checkpoint 边界之后积累的若干轮中间交互**，
+不是把多个用户回合合并，也不是生成一条用户可见的最终回答。
+
 某些工具可以在 metadata 中返回：
 
 ```python
@@ -1006,6 +1011,25 @@ MCP 工具默认不把完整 schema 全部塞进模型上下文：
 ```
 
 Agent Loop 收到后，会删除 checkpoint 边界之后积累的 narration 和原始 tool results，改为一条 `[Context checkpoint]` system 摘要。后续 checkpoint 会保留之前的摘要并继续追加。
+
+因此，同一用户回合的内部 `messages` 可能从：
+
+```text
+system -> user -> assistant(tool_calls) -> tool -> assistant(tool_calls) -> tool
+```
+
+折叠为：
+
+```text
+system -> user -> system([Context checkpoint] 阶段摘要)
+```
+
+这条 checkpoint 是只供后续 LLM round 使用的内部上下文，最终用户仍然看到
+`user -> assistant` 的对话结果。**已验证事实**是实现明确写入
+`{"role": "system"}`，而不是 `assistant`。从角色语义看，原因是 checkpoint
+由 Runtime 注入，用来描述已经完成的阶段状态，不是模型曾经说过的一句话；若写成
+`assistant`，它会被解释成模型的历史输出。使用 `system` 能把运行时状态与模型回答
+明确分开，并让后续 round 把它作为背景上下文继续执行。
 
 `checkpoint_boundary` 就是当前 `messages` 列表里的一个整数下标，表示“这个位置之前的
 消息已经是必须保留的稳定前缀”。它在循环开始时等于初始 messages 的长度，因此
@@ -1456,6 +1480,12 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-18
+
+- 6.8 节补充 session、用户回合与 AgentLoop 内部 round 的层级关系，明确 Context
+  Checkpoint 压缩的是同一用户回合内的中间工具交互，而非用户可见输出；同时解释
+  checkpoint 使用 `system` 角色是为了表达 Runtime 注入的阶段状态，而不是模型历史回答。
 
 ### 2026-08-10
 
