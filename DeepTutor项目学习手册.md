@@ -493,32 +493,134 @@ Tool；模型匹配到任务时，再调用 `read_skill` 读取完整 `SKILL.md`
 
 **状态：已验证到存储结构、归并入口和 Chat 注入**
 
-记忆模块以当前用户的 memory root 为隔离边界，数据分三层：
+Memory 模块是 Agent 的**长期记忆子系统**，负责把用户在不同业务场景中产生的
+原始交互和行为数据，提炼成可追溯、可更新、可按需读取的用户记忆，并在后续回合
+中提供给 Agent。它不是 LLM 本身，也不等同于当前回合的 conversation history 或
+知识库 RAG：history 主要服务当前上下文窗口，RAG 提供外部资料，Memory 则沉淀
+用户跨回合、跨场景的稳定事实、学习状态和显式偏好。
 
-| 层级 | 存储 | 职责 |
+代码上，`MemoryStore` 是统一门面；Snapshot Adapter 负责从各业务存储读取实体，
+Trace 负责追加原始事件，consolidator 负责 L1→L2→L3 的 LLM 归并、审计、去重和
+结构合并，`read_memory` / `write_memory` 则是 Agent 可调用的记忆读写入口。
+
+记忆模块以当前用户的 memory root 为隔离边界。这里的“三层”不是数据库冷热分层，
+而是从业务原文到场景事实、再到跨场景长期认识的逐级提炼：
+
+| 层级 | 主要存储 | 职责 |
 | --- | --- | --- |
-| L1 | `trace/<surface>/<YYYY-MM-DD>.jsonl` | 按场景追加原始事件 |
-| L2 | `L2/<surface>.md` | 将单一场景的 L1 事件归并为带来源引用的结构化记忆 |
-| L3 | `L3/<recent\|profile\|scope\|preferences>.md` | 跨场景聚合近期状态、画像、范围与偏好 |
+| L1 | `snapshot/<surface>/`、`trace/<surface>/<YYYY-MM-DD>.jsonl` | 保留各业务场景的当前原始实体、变更记录和事件 Trace |
+| L2 | `L2/<surface>.md`、`L2/<surface>.meta.json` | 从单一场景增量提取带来源引用的短事实 |
+| L3 | `L3/<recent\|profile\|scope\|preferences>.md` 及对应 meta | 跨场景聚合近期状态、稳定画像、知识范围和显式偏好 |
 
-L2 场景定义为 `chat`、`notebook`、`quiz`、`kb`、`book`、`partner`、
-`cowriter`。`MemoryStore` 是公共门面：`emit()` 写 L1，`update_l2()` 交给
-consolidator 执行 L1 到 L2 归并，`update_l3()` 执行 L2 到 L3 聚合，并支持
-预览操作后的原子应用。`preferences` 不走自动 L3 归并，由 `write_memory`
-Tool 写入。
+#### 持久化边界：记忆会保存，但不是统一写入关系型数据库
 
-当回合选择了 memory references 时，`turn_runtime` 通过
-`MemoryStore.read_l3_concat()` 读取四个 L3 文档，写入
-`UnifiedContext.memory_context`；Chat 的 Prompt 组装再把它作为 Memory 块注入
-System Prompt。
+“L1/L2/L3 入库”需要区分**持久化**和**写入 MySQL/SQLite 表**：
+
+- **L1 的业务原始数据**仍保存在各自业务存储中。以 Chat 和 Quiz 为例，消息、
+  题目及作答记录来自会话 SQLite；Notebook、KB、Partner 等 surface 则由对应的
+  JSON、JSONL 或 workspace 文件提供。L1 不是一张统一的 memory 表。
+- **L1 的记忆侧索引与证据**保存在当前用户的 memory root：Snapshot 的
+  `state.json` / `changes.jsonl` 记录实体指纹和变更，`trace/<surface>/` 下的
+  JSONL 记录按场景追加的原始事件。Snapshot 刷新和 Trace 追加都是文件持久化。
+- **L2 和 L3 的归并结果**直接持久化为 Markdown 文档及旁路的 `*.meta.json`，
+  更新时通过临时文件加原子替换写盘；它们不是 MySQL 表，也不是向量数据库中的
+  embedding。L2/L3 的文档 ID、引用关系和增量处理状态都在这些文件中维护。
+- 当前实现中，业务原始数据会随业务流程持续写入；L2/L3 则由 Memory Workbench
+  或 `run_update` 更新流程触发，并非每条消息都同步执行一次 LLM 归并。更新后可按
+  配置自动执行 dedup / merge。
+
+因此更准确的说法是：**三层记忆都做了持久化，L1 连接业务原始存储并保存文件型
+证据索引，L2/L3 采用按用户隔离的 Markdown + JSON 文件存储，而不是统一“入库”到
+MySQL。**
+
+需要区分两个容易混淆的概念：
+
+```text
+业务原始数据（事实来源）
+SQLite / JSON / JSONL / workspace 文件
+              │ Snapshot Adapter 读取并统一包装
+              ▼
+L1（Memory 的原始证据视图）
+Entity + fingerprint + snapshot state/change + Trace
+              │ LLM 增量提取
+              ▼
+L2（场景事实） → L3（跨场景长期记忆）
+```
+
+因此，“原始数据层”通常指业务系统里的 source of truth；“L1”是记忆系统对这些
+原始数据的逻辑层和证据入口。当前实现不会把所有业务原文再复制到 L1 目录：Chat
+原文仍在会话 SQLite 中，Adapter 读取后临时构造 `Entity`；L1 目录主要保存
+fingerprint、变更日志和 Trace。面试中可以简化说“L1 保留原始交互证据”，但不要
+说成“L1 一定是一张保存全部 user/assistant/system 原文的表”。
+
+#### L1：原始数据与证据层
+
+L1 当前有两种互补来源。`snapshot.adapters` 从真实业务存储读取 `chat`、
+`notebook`、`quiz`、`kb`、`book`、`partner`、`cowriter` 七类实体；每个
+`Entity` 都有稳定 id、时间、完整正文、metadata 和 fingerprint。刷新时把
+fingerprint 集合写入 `snapshot/<surface>/state.json`，并把 added / modified /
+removed 变化追加到 `changes.jsonl`。此外，`MemoryStore.emit()` 会把偏好声明、
+KB 查询等事件追加到按天分片的 Trace JSONL；该写入失败只记录日志，不反向打断业务。
+
+#### L1 到 L2：单场景事实抽取
+
+L2 场景与上述七个 surface 一一对应。更新某个 L2 时，consolidator 通过
+`snapshot.read_snapshot(surface)` 读取当前实体，再用 `<surface>:<entity_id>`
+与 `<surface>.meta.json` 中的 `seen_entity_refs` 做集合差，只处理未归并的实体。
+新实体按时间排列并按边界切块，LLM 只能输出指定 section 下、长度不超过 240 字符
+且带本 chunk 合法 ref 的事实。Runtime 会再次校验引用池，然后通过统一 `AddOp`
+追加到 Markdown 文档并原子写盘；可配置在更新后继续运行 LLM 去重和无 LLM 的
+结构合并。由此 L2 保存的是“Chat 中反复出现的误解”“Quiz 中的错误模式”这类
+场景事实，而不是整段原文副本。
+
+#### L2 到 L3：跨场景综合
+
+更新 L3 时，consolidator 读取七份 L2 文档，通过各 L2 entry id 与 L3 meta 的
+`seen_l2_entry_ids` 做增量判断，再让 LLM 按 slot 综合：`recent` 记录近期活动，
+`profile` 记录有多处证据支撑的稳定画像，`scope` 记录熟悉、练习中或不确定的知识
+范围。当前 L3 事实引用的是参与综合的裸 surface 名，因此追溯路径是
+`L3 -> L2 surface 文档 -> L1 entity`。提示词要求结论保持客观、带场景限定，并由
+Runtime 校验引用、长度和文档结构。`preferences` 不参与自动聚合，只在用户明确
+表达偏好时由 `write_memory` Tool 写入；该 Tool 同时生成一条 L1 Trace 作为来源。
+
+#### 回到 Agent 上下文
+
+当请求显式携带 memory references 时，`turn_runtime` 调用
+`MemoryStore.read_l3_concat()` 拼接四份 L3 文档，写入
+`UnifiedContext.memory_context`，随后 `ChatPromptAssembler` 把它作为独立的
+`memory` System Prompt block 注入本回合。没有显式预注入时，只要用户已有 L3
+内容，Chat 仍可自动挂载 `read_memory` Tool，由模型在需要个性化回答时按需读取。
+因此长期记忆既支持回合开始前的显式注入，也支持 Agent Loop 内的按需检索。
+
+#### 三层记忆分别在什么时候使用
+
+三层不是每轮对话都同时发送给模型，而是分别服务于不同阶段：
+
+| 层级 | 主要使用时机 | 当前作用 |
+| --- | --- | --- |
+| L1 | 业务数据采集、Snapshot 刷新、Trace 追加，以及 L2 更新或审计时 | 提供未经语义压缩的原始证据和可追溯来源，通常不直接注入 Chat Prompt |
+| L2 | 从 L1 更新场景记忆、执行 L2 审计/去重/合并，以及生成 L3 时 | 提供某个 surface 的结构化事实，当前主要作为 L3 的输入和 Memory Workbench 的审计对象 |
+| L3 | 回合开始前显式选择记忆，或 Agent 在对话中调用 `read_memory` 时 | 提供跨场景的近期状态、画像、知识范围和偏好，是当前 Chat Agent 主要直接消费的长期记忆 |
+
+例如一次新对话完成后，原始消息先进入业务存储，相关事件可追加到 L1；执行
+`run_update("L2", "chat")` 时，L1 被读取并提取为 Chat 场景事实；再执行
+`run_update("L3", "profile")` 或其他 slot 更新时，L2 被跨场景综合。下一次
+对话若需要个性化信息，`turn_runtime` 读取 L3 并注入 `UnifiedContext`，或者由
+Agent 调用 `read_memory` 读取。也就是说，L1/L2 主要支撑“记忆生成、审计和追溯”，
+L3 主要支撑“对话时使用”。
 
 关键证据：
 
 - `deeptutor/services/memory/__init__.py`
-- `deeptutor/services/memory/paths.py:1-89`
+- `deeptutor/services/memory/paths.py:1-103`
+- `deeptutor/services/memory/snapshot/__init__.py`
+- `deeptutor/services/memory/snapshot/adapters.py`
+- `deeptutor/services/memory/consolidator/modes/update.py`
+- `deeptutor/services/memory/consolidator/modes/dedup.py`
 - `deeptutor/services/memory/store.py:47-216`
 - `deeptutor/services/session/turn_runtime.py:1364,1616-1625`
 - `deeptutor/agents/chat/prompt_blocks.py:71-72`
+- `deeptutor/tools/builtin/__init__.py:633-750`
 
 ## 6. 一次对话的主调用链
 
@@ -1480,6 +1582,25 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-19
+
+- 重写 5.6 节三层记忆链路：补充 L1 Workspace Snapshot 与 Trace 两类原始来源，
+  说明 L2 基于实体引用集合的增量事实抽取、引用校验和去重，明确 L3 的四类 slot、
+  当前 surface 级追溯关系，以及长期记忆通过显式 Prompt 注入和 `read_memory` Tool
+  按需读取的两条回流路径。
+
+### 2026-08-20
+
+- 补充 5.6 节的持久化边界，区分业务原始存储、L1 文件型 Snapshot/Trace，以及
+  L2/L3 Markdown + meta JSON；明确三层均持久化但不统一写入关系型数据库，且
+  L2/L3 由更新流程触发而非每条消息同步归并。
+- 补充 Memory 模块的职责边界，区分长期记忆、当前会话历史和知识库 RAG，并记录
+  `MemoryStore`、Snapshot、Trace、consolidator 及记忆 Tool 的分工。
+- 补充“业务原始数据”和 L1 逻辑层的关系，明确 L1 通过 Adapter 建立原始证据视图，
+  当前实现不要求将所有业务原文复制到 memory 目录。
+- 补充 L1/L2/L3 的使用时机，区分记忆生成、审计追溯与 Chat Agent 运行时消费，
+  明确当前默认对话主要直接读取 L3。
 
 ### 2026-08-18
 
