@@ -500,7 +500,7 @@ Memory 模块是 Agent 的**长期记忆子系统**，负责把用户在不同�
 用户跨回合、跨场景的稳定事实、学习状态和显式偏好。
 
 代码上，`MemoryStore` 是统一门面；Snapshot Adapter 负责从各业务存储读取实体，
-Trace 负责追加原始事件，consolidator 负责 L1→L2→L3 的 LLM 归并、审计、去重和
+Trace 负责追加原始事件，consolidator 负责 Snapshot Entity→L2→L3 的 LLM 归并、审计、去重和
 结构合并，`read_memory` / `write_memory` 则是 Agent 可调用的记忆读写入口。
 
 记忆模块以当前用户的 memory root 为隔离边界。这里的“三层”不是数据库冷热分层，
@@ -562,6 +562,34 @@ fingerprint 集合写入 `snapshot/<surface>/state.json`，并把 added / modifi
 removed 变化追加到 `changes.jsonl`。此外，`MemoryStore.emit()` 会把偏好声明、
 KB 查询等事件追加到按天分片的 Trace JSONL；该写入失败只记录日志，不反向打断业务。
 
+L1 不是一个需要由 L2 “启动”的常驻任务。业务流程先独立写入各自的事实存储；
+`snapshot.read_snapshot(surface)` 每次都通过 Adapter 现场读取这些数据。
+`refresh_snapshot(surface)` 只是把当前 fingerprint 和差异日志落盘。当前
+`run_update("L2", surface)` 直接调用 `read_snapshot()`，不会先调用
+`refresh_snapshot()`。因此，更新 L2 会消费 L1 的实时证据视图，但不等于启动
+或刷新 L1。
+
+`Entity` 是本次调用期间的标准化 Python 对象，不是另一份持久化业务数据。
+它用 `id` 建立 `<surface>:<id>` 证据引用，用 `label` 和 `ts` 在 L1 界面展示，
+用 `content` 向 L2 Update/Audit 提供完整正文，用 `metadata` 保留业务语义，用
+`fingerprint` 判断同 id 实体的内容是否变化。API 返回或归并调用结束后，这批
+`Entity` 对象就释放；Snapshot 目录不保存其完整 `content`。
+
+当前真正调用 `read_snapshot()` 的地方只有三类：打开 Memory 首页或 L1 页面时的
+`GET /memory/snapshot/{surface}`（包括页面重新获得焦点时重读）、L2 Update，
+以及 L2 Audit。点击 L1 页的 Refresh 才会调用 `refresh_snapshot()`，把当前
+`{entity_id: fingerprint}`、label 和 `last_refresh` 原子写入 `state.json`，并把与上次
+state 相比的 added / modified / removed 追加到 `changes.jsonl`。这个 Refresh 的用途是
+让 L1 界面能显示“自上次确认后发生了什么变化”，它不会调用 LLM，也不会
+自动触发 L2。
+
+Trace 是 L1 的另一条独立写入路径。例如 RAG 查询完成时追加 `kb/query`，
+`write_memory` 写显式偏好时追加 `chat/preference_stated`，直接按 UTC 日期写入
+`trace/<surface>/<date>.jsonl`。根据当前 `run_update("L2", ...)` 实现，自动 L2 Update
+只读 Snapshot Entity，并不读通用 Trace JSONL。Trace 目前可通过
+`GET /memory/trace/{surface}` 读取；KB query 还会显示在 L1 Queries 页、计入 L2 overview
+的 backlog，而 `preferences` 条目会保存 preference Trace id 作为来源 ref。
+
 #### L1 到 L2：单场景事实抽取
 
 L2 场景与上述七个 surface 一一对应。更新某个 L2 时，consolidator 通过
@@ -573,6 +601,12 @@ L2 场景与上述七个 surface 一一对应。更新某个 L2 时，consolidat
 结构合并。由此 L2 保存的是“Chat 中反复出现的误解”“Quiz 中的错误模式”这类
 场景事实，而不是整段原文副本。
 
+这里的“反复出现”是归并提示词的语义目标，不是当前代码里的次数阈值。
+`update_l2.yaml` 要求抽取“稳定事实”，各 surface 的 focus 也强调反复主题或错误模式；
+但 Runtime 只硬性校验事实至少有 1 个本 chunk 的合法 ref，没有要求“至少出现
+2 次”或“至少 2 个 ref”。所以它目前是 LLM 基于证据的语义归纳，不是可复现的
+统计判定。
+
 #### L2 到 L3：跨场景综合
 
 更新 L3 时，consolidator 读取七份 L2 文档，通过各 L2 entry id 与 L3 meta 的
@@ -582,6 +616,11 @@ L2 场景与上述七个 surface 一一对应。更新某个 L2 时，consolidat
 `L3 -> L2 surface 文档 -> L1 entity`。提示词要求结论保持客观、带场景限定，并由
 Runtime 校验引用、长度和文档结构。`preferences` 不参与自动聚合，只在用户明确
 表达偏好时由 `write_memory` Tool 写入；该 Tool 同时生成一条 L1 Trace 作为来源。
+
+L3 也不能整体等同于“用户画像”：只有 `profile` slot 专门承载身份、学习风格和
+知识水平；`recent`、`scope`、`preferences` 分别承载近期活动、知识边界和显式偏好。
+`profile` 的 focus 要求多个 surface、多个 L2 条目支撑，但当前引用校验器只强制至少
+1 个合法 surface ref，并未从代码上强制“跨多个 surface”；这同样属于提示词设计目标。
 
 #### 回到 Agent 上下文
 
@@ -602,6 +641,33 @@ Runtime 校验引用、长度和文档结构。`preferences` 不参与自动聚�
 | L2 | 从 L1 更新场景记忆、执行 L2 审计/去重/合并，以及生成 L3 时 | 提供某个 surface 的结构化事实，当前主要作为 L3 的输入和 Memory Workbench 的审计对象 |
 | L3 | 回合开始前显式选择记忆，或 Agent 在对话中调用 `read_memory` 时 | 提供跨场景的近期状态、画像、知识范围和偏好，是当前 Chat Agent 主要直接消费的长期记忆 |
 
+#### 从触发到消费的实际生命周期
+
+当前没有将 L1→L2→L3 串成自动流水线，也没有 Memory 定时归并任务。每个动作
+都有独立触发点：
+
+| 动作 | 当前触发方式 | 运行时做什么 | 持久化结果 | 后续会不会自动继续 |
+| --- | --- | --- | --- | --- |
+| 构造 L1 Snapshot 视图 | 打开 Memory/L1、返回页面焦点、L2 Update、L2 Audit，或直接调 API | Adapter 读业务存储并构造 `list[Entity]` | 默认不保存 Entity 正文 | 不会 |
+| 提交 L1 Snapshot 差异 | L1 页点 Refresh，或 POST refresh API | 用 fingerprint 比较上次 state | `state.json` + `changes.jsonl` | 不会触发 L2 |
+| 追加 L1 Trace | 特定业务事件，如 KB 查询、明确偏好写入 | 标准化为 `TraceEvent` 并追加 | `trace/<surface>/<date>.jsonl` | 不会自动触发 L2 |
+| 生成/增量更新 L2 | L2 Workbench 选中 surface 后点 Update，或调 Update API | 现场读 Entity，仅抽取未见 id，LLM 生成带证据 ref 的事实 | `L2/<surface>.md` + `.meta.json` | 可按设置自动 dedup/merge，不会生成 L3 |
+| 生成/增量更新 L3 | L3 Workbench 选中 `recent/profile/scope` 后点 Update，或调 Update API | 读所有 L2，仅综合未见 L2 entry | `L3/<slot>.md` + `.meta.json` | 可按设置自动 dedup/merge |
+| 写 L3 偏好 | 对话中用户明确表达偏好，Agent 调 `write_memory` | 直接增改 `preferences` 并生成 Trace 证据 | `L3/preferences.md` + L1 Trace | 立即可被后续对话读取 |
+| 消费 L3 | 对话编辑器显式选择 Memory，或 Agent 调 `read_memory` | `read_l3_concat()` 拼接四份 L3 | 不产生新记忆 | 注入当前 Prompt 或返回 Tool 结果 |
+
+L2/L3 的 Markdown 不是等全部 chunk 处理完才一次写入；每个 chunk 只要有合法新事实，
+`write_doc_checkpoint()` 就会先序列化 Markdown，通过临时文件 + `os.replace()` 原子替换，
+并注册本次 run 的 Undo checkpoint。所有 chunk 结束后，再写 `.meta.json` 记录已看过的
+上游 ID。
+
+当前还有一个需要明确的增量边界：Snapshot 的 fingerprint 可以把同 id 的内容变化
+显示为 `modified`，但 L2 Update 的增量集合只比较 `<surface>:<entity_id>` 是否已在
+`seen_entity_refs`，不比较 fingerprint。因此，已处理的 Chat session 后续增加消息时，
+L1 Refresh 会显示 modified，但普通 L2 Update 不会因此重新抽取该 session。L2 Audit
+会重读当前 Entity 来核验已有 L2 条目；若要让 Update 全量重做，Workbench 的 Reset
+会删除该 L2 Markdown 和 meta，下一次 Update 才会重新摄取全部 Entity。
+
 例如一次新对话完成后，原始消息先进入业务存储，相关事件可追加到 L1；执行
 `run_update("L2", "chat")` 时，L1 被读取并提取为 Chat 场景事实；再执行
 `run_update("L3", "profile")` 或其他 slot 更新时，L2 被跨场景综合。下一次
@@ -609,18 +675,134 @@ Runtime 校验引用、长度和文档结构。`preferences` 不参与自动聚�
 Agent 调用 `read_memory` 读取。也就是说，L1/L2 主要支撑“记忆生成、审计和追溯”，
 L3 主要支撑“对话时使用”。
 
+#### Mem0 OSS 对照：条目化存储与查询感知召回
+
+为评估 Markdown 全量读取的替代方案，已对照 Mem0 官方仓库
+`4fa483907704735ba0bec030e3c946ee1614b50e`（2026-08-20）的当前 OSS 实现。
+下述结论是对该版本源码的阅读结果，不是 DeepTutor 已有功能。
+
+Mem0 不使用 DeepTutor 这种 L1/L2/L3 Markdown 文档。它把长期记忆拆成
+独立条目：默认主存储是 Qdrant，每条保存 UUID、embedding 和 payload；
+payload 包含记忆文本 `data`、BM25 预处理文本 `text_lemmatized`、内容 hash、
+`user_id` / `agent_id` / `run_id`、归属、时间和业务 metadata。SQLite
+`history.db` 只负责记录变更历史，并为每个 session scope 保留最近 10 条
+消息供后续抽取解析，它不是主记忆检索库。
+
+`Memory.add(infer=True)` 当前的主链路是：
+
+```text
+新消息 + 该 scope 最近 10 条消息
+        │
+        ├─用新消息做向量查询，取 10 条相关旧记忆
+        │
+        └─单次 LLM 抽取自包含的新记忆条目
+                 ↓
+      批量 embedding → MD5 精确去重 → 向量库批量 ADD
+                 ↓
+      SQLite 写 ADD 审计记录 + 实体索引 + 最近消息
+```
+
+这条 v3 主链路已从旧版 `ADD/UPDATE/DELETE/NONE` 决策改为 ADD-only。
+旧版 prompt 和 `_update_memory()` / `_delete_memory()` 公共操作仍保留在代码中，
+但不应据此把当前自动抽取说成“LLM 会修改或删除旧记忆”。
+`infer=False` 则跳过 LLM，把非 system 消息原文直接作为记忆条目。
+
+`Memory.search()` 是 query-aware 召回，而不是把全部记忆拼入 Prompt：
+
+1. 先用 `user_id` / `agent_id` / `run_id` 及 metadata 限定租户和业务范围。
+2. 对 query 做 embedding、BM25 词形化和实体抽取。
+3. 向量检索过取 `max(4 * top_k, 60)` 条，并在支持的向量库上单独做
+   keyword/BM25 检索。独立实体 collection 把查询实体映射回关联的 memory id。
+4. `threshold` 先对 semantic score 做硬门限，默认为 `0.1`；过期条目
+   默认被过滤。通过门限后再计算
+   `(semantic + normalized_bm25 + entity_boost) / max_possible`，实体加分上限为 `0.5`。
+5. 按组合分数取 `top_k`；配置 reranker 且调用时传 `rerank=True`，才会再重排。
+   `explain=True` 可返回各信号分数，便于调参。
+
+当前 OSS 实现有三个不能忽略的边界。第一，最终候选集只由
+semantic search 结果构成，BM25 和实体信号只能给已进入候选集的条目
+加分，不能独立召回一条向量漏检的记忆。第二，`latest_only`、
+`reference_date` 和 decay 等能力出现在 Platform 客户端或提示中；OSS
+`Memory.search()` 没有 `latest_only`，并且会明确拒绝 `reference_date`。
+第三，虽然 v3 prompt 要求 LLM 输出 `linked_memory_ids`，但该版本
+`_add_to_vector_store()` 没有把这个字段映射并写入主 memory payload，
+`uuid_mapping` 也未被后续使用。因此当前源码中可验证的
+`linked_memory_ids` 主要是“实体索引→记忆条目”关联，不能把
+Platform changelog 所述的完整版本链直接当成当前 OSS 已落地事实。
+
+以用户偏好变化为例，实际语义是：
+
+```text
+用户：我喜欢川菜
+→ LLM 可能抽取：“用户喜欢川菜”
+→ 向量库新增一条 memory，并写 embedding、hash、user_id 和时间
+
+用户：最近胃不舒服，暂时不能吃辣
+→ 写入前召回“用户喜欢川菜”作为去重和关联上下文
+→ LLM 可能新增：“用户因近期胃部不适，暂时不能吃辣”
+→ ADD-only 意味着前后两条会共存，旧偏好不会被自动删除
+
+用户：帮我推荐晚餐
+→ 向量相似度可能把两条都召回，BM25/实体信号只负责加分
+→ OSS search 本身不判定“暂时不能吃辣”应覆盖当前菜品选择
+```
+
+具体抽取文本和排名是模型与 embedding 相关的，上例是依照已验证
+代码链路给出的结果示意，不是确定性输出。它说明了一个工程边界：
+“相关召回”不等于“冲突解析”。如果推荐必须遵循当前健康约束，
+业务层还需要有效期、事实状态、版本关系或召回后冲突判定。
+
+对 DeepTutor 的可取之处不是去掉 L1/L2/L3，而是把它们保留为
+内部语义分层，将运行时存储和召回改为条目化：L1 保留可追溯证据，
+L2 保存带 source ref、scope、状态和 embedding 的场景事实，L3 保存
+有多条 L2 证据支撑的跨场景结论。召回时可按用户和场景过滤，
+取向量与 BM25 候选的并集，加上实体、时效、重要度和证据质量分数，
+再在 token budget 内组装少量相关记忆。冲突事实宜采用“新增版本、
+标记旧版失效并记录 `supersedes_id`”，而不是直接覆盖；这样同时保留
+可追溯性与当前有效状态。这些是可选演进方向，尚未在当前代码中实现。
+
+一句话区分两者：**DeepTutor 当前是分层文档式归并 + L3 整体读取；
+Mem0 OSS 当前是 LLM 条目抽取 + 向量主存储 + 查询感知混合检索。**
+
+为验证这条演进路径，`learning/demos/memory_hybrid_demo.py` 提供了一个
+不接入生产 Memory 的可运行原型。它用 SQLite 的 `evidence` 表示 L1，
+用条目化 `memories` 表表示 L2/L3；两条川菜偏好 L2 事实可归并出
+带上游 memory id 的 L3 profile。暂时不能吃辣与恢复吃辣使用
+`status=active|superseded` 和 `supersedes_id` 保留版本历史，召回只读取
+active 条目。原型使用语义相似度、简化 BM25、concept 重合、importance
+和 constraint 业务优先级的组合分数，再在近似 token budget 内组装上下文。
+其中 `RuleBasedDemoExtractor` 和 `LocalHashEmbedder` 只是为了无模型、无外部服务
+也能重现数据流；正式实现时应替换为结构化 LLM 抽取和真实 embedding，
+并将全量 SQLite 扫描替换为可扩展索引。这一原型已有行为测试，
+但尚未被 `MemoryStore`、Chat Tool 或 `turn_runtime` 调用。
+
 关键证据：
 
 - `deeptutor/services/memory/__init__.py`
 - `deeptutor/services/memory/paths.py:1-103`
 - `deeptutor/services/memory/snapshot/__init__.py`
 - `deeptutor/services/memory/snapshot/adapters.py`
+- `deeptutor/services/memory/snapshot/entity.py`
+- `deeptutor/services/memory/trace.py`
+- `deeptutor/services/memory/consolidator/meta.py`
 - `deeptutor/services/memory/consolidator/modes/update.py`
+- `deeptutor/services/memory/consolidator/modes/audit.py`
+- `deeptutor/services/memory/consolidator/modes/_runtime.py:216-278`
 - `deeptutor/services/memory/consolidator/modes/dedup.py`
 - `deeptutor/services/memory/store.py:47-216`
+- `deeptutor/api/routers/memory.py:140-345,680-785`
 - `deeptutor/services/session/turn_runtime.py:1364,1616-1625`
 - `deeptutor/agents/chat/prompt_blocks.py:71-72`
 - `deeptutor/tools/builtin/__init__.py:633-750`
+- `web/components/memory/MemorySection.tsx:653-890`
+- `web/components/memory/MemoryRunPanel.tsx:52-170`
+- Mem0 `4fa483907704735ba0bec030e3c946ee1614b50e`：
+  `mem0/memory/main.py:487-580,760-1196,1255-1522,1628-1813`
+- Mem0 `mem0/utils/scoring.py:16-139`、`mem0/memory/storage.py:102-324`、
+  `mem0/configs/prompts.py:468-944,1016-1061`、`mem0/client/types.py:41-85`、
+  `docs/changelog/sdk.mdx:322-343`
+- `learning/demos/memory_hybrid_demo.py`
+- `tests/learning/test_memory_hybrid_demo.py`
 
 ## 6. 一次对话的主调用链
 
@@ -1582,6 +1764,22 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-21
+
+- 在 5.6 节加入 Mem0 OSS 当前写入、条目存储和混合召回链路对照，
+  区分 OSS 与 Platform 能力，并记录该版本 `linked_memory_ids` 提示词与
+  主记忆 payload 实际落盘之间的实现缺口；补充保留内部 L1/L2/L3、
+  将存储和召回演进为条目化混合检索的可选路径。
+- 增加不接入生产链路的 Memory 混合召回学习原型，可直接演示
+  L1 evidence、L2 事实、L3 profile、组合召回、token budget 组装，以及
+  `supersedes_id` 与 active/superseded 事实版本机制。
+- 补充 5.6 节 Memory 分层的执行边界：明确 L2 更新会现场读取 L1 Snapshot
+  视图，但不会启动或刷新 L1；同时区分 L2 “反复出现”和 L3 `profile`
+  “多场景支撑”的提示词目标与当前引用校验器真正强制的硬规则。
+- 补充 L1/L2/L3 从触发、运行时对象、落盘到后续消费的完整生命周期；明确
+  Snapshot Refresh 只提交差异账本、当前通用 Trace 不输入 L2 Update、归并无自动
+  跨层触发，并记录 L2 增量判断只比较 Entity id 而不比较 fingerprint 的实现边界。
 
 ### 2026-08-19
 
