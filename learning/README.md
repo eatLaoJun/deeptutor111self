@@ -11,6 +11,8 @@
 
 - `plans/resume-interview-7day-plan.md`：围绕简历“极光智能学习机”项目的一周面试准备计划；后续复习和模拟面试优先读取此文件及对应的 `notes/day*.md`。
 - `interview-scripts/DeepTutor多时长项目介绍.md`：15 秒、30 秒、60 秒、90 秒和 3 分钟项目介绍，以及第一条职责的专项版本。
+- `interview-scripts/DeepTutor三层记忆多时长介绍.md`：Memory 专项 3、5 分钟口述稿及面试追问，
+  重点讲 L1 原始事件、L2 场景记忆、L3 增量归并和关系库实现。
 
 与项目正式知识库的区别：
 
