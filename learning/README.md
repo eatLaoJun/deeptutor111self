@@ -13,6 +13,8 @@
 - `interview-scripts/DeepTutor多时长项目介绍.md`：15 秒、30 秒、60 秒、90 秒和 3 分钟项目介绍，以及第一条职责的专项版本。
 - `interview-scripts/DeepTutor三层记忆多时长介绍.md`：Memory 专项 3、5 分钟口述稿及面试追问，
   重点讲 L1 原始事件、L2 场景记忆、L3 增量归并和关系库实现。
+- `interview-scripts/鼎校伴学-Agent-Runtime-3分钟与5分钟.md`：对应简历第一条职责，包含
+  Agent Runtime 专项 3、5 分钟口述稿、速记主线和表达边界。
 
 与项目正式知识库的区别：
 

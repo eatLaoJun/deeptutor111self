@@ -622,6 +622,54 @@ L3 也不能整体等同于“用户画像”：只有 `profile` slot 专门承�
 `profile` 的 focus 要求多个 surface、多个 L2 条目支撑，但当前引用校验器只强制至少
 1 个合法 surface ref，并未从代码上强制“跨多个 surface”；这同样属于提示词设计目标。
 
+#### 广义用户画像与内部 slot 生命周期
+
+对产品和简历表述，可以把 L3 中所有跨 Session 的用户长期信息统一称为**广义用户画像**，
+其内部包含稳定特征、近期活动、知识状态和显式偏好。“统一叫用户画像”是对外概念收敛，
+不代表内部所有信息采用同一种生命周期。当前 DeepTutor 没有名为 `learning_state` 的单独
+slot：稳定身份、学习风格、知识水平进入 `profile`，最近 1～4 周活动进入 `recent`，已接触
+概念及“熟悉/练习中/不确定”进入 `scope`，显式偏好进入 `preferences`。
+
+需要注意术语范围：源码中的 `profile` 只表示广义用户画像里的稳定画像维度，并不等于整个
+L3；对外说“用户画像”时则可以统称 `profile + recent + scope + preferences`。
+
+| 维度 | 稳定画像维度（`profile`） | 动态学习维度（`recent + scope`） |
+| --- | --- | --- |
+| 典型内容 | 年级、长期学习风格、相对稳定的知识水平 | 当前章节、知识点掌握度、近期错题、任务进度 |
+| 稳定性 | 较高，跨较长时间成立 | 较低，会随练习、测评和复习持续变化 |
+| 推荐更新触发 | 明确信息变更，或多次/跨场景证据形成稳定结论 | 完成练习、测评、任务或一次有效学习 Session 后 |
+| 推荐更新频率 | 低频、证据阈值高，通常按天/周或事件触发 | 高频、事件驱动，可按回合后或批次聚合 |
+| 冲突处理 | 谨慎覆盖，需要新证据足够稳定 | 新结果可按时间和置信度快速替换旧状态 |
+| 时效策略 | 长期有效，缓慢衰减或显式修改 | 必须带时间，过期、衰减或被更新状态覆盖 |
+| Agent 用途 | 调整讲解风格、默认难度和交互方式 | 选择下一知识点、复习内容和练习难度 |
+
+两类信息可以同时进入 `UnifiedContext`，但不应无条件把全部历史内容每轮完整注入。推荐让
+画像保持短小并以较高优先级提供稳定约束，再按当前问题检索相关的最新学习状态；每条状态
+保留 `updated_at`、来源证据和置信度，避免 Agent 使用已经过期的掌握结论。
+
+这里的“区分”是逻辑生命周期隔离，不要求物理上拆成两个数据库。`profile`、`recent`、
+`scope`、`preferences` 本身已经是类型标签，关系数据库中可以统一使用一张 L3 表，以
+`(user_id, slot)` 作为唯一键分别保存内容和元数据，不需要再增加重复的 `memory_type`。
+关键是每个 slot 独立维护版本、更新时间、证据、置信度和过期策略，并允许局部更新。
+若把全部 slot 放进同一行 JSON 也能工作，但高频更新 `recent/scope` 时需要处理整行覆盖和
+并发写冲突；“同表按 slot 分行”通常更直接。
+
+`UnifiedContext` 是一次请求的组合视图，不是持久化数据模型：Context Builder 可以把同表
+中的多个 slot 组装成一个 `memory_context`。当前 DeepTutor 把 L3 分别保存为多个 Markdown
+文件，再由 `read_l3_concat()` 统一拼接；这是文件存储下的实现选择，而不是必须物理分离的
+架构约束。整体仍可概括为“按 slot 独立更新，读取时组合消费”。
+
+**当前实现边界：** `profile`、`recent`、`scope` 都由用户在 Memory Workbench 选择 slot
+执行 Update，或直接调用对应 API 后，基于未处理的 L2 entry 增量生成；仓库当前没有为
+画像和学习状态设置不同周期的自动调度。因此表中的更新频率属于推荐的 Runtime 策略，
+不是已经存在的定时任务。
+
+关键证据：
+
+- `deeptutor/services/memory/consolidator/prompts/zh/_meta.yaml:26-35`
+- `deeptutor/services/memory/consolidator/modes/update.py:357-706`
+- `deeptutor/services/memory/store.py:103-151`
+
 #### 回到 Agent 上下文
 
 当请求显式携带 memory references 时，`turn_runtime` 调用
@@ -630,6 +678,184 @@ L3 也不能整体等同于“用户画像”：只有 `profile` slot 专门承�
 `memory` System Prompt block 注入本回合。没有显式预注入时，只要用户已有 L3
 内容，Chat 仍可自动挂载 `read_memory` Tool，由模型在需要个性化回答时按需读取。
 因此长期记忆既支持回合开始前的显式注入，也支持 Agent Loop 内的按需检索。
+
+#### RAG 证据与 Tool Result：本轮上下文和持久化边界
+
+**状态：已验证当前 Chat 主链路**
+
+RAG 证据和 Tool Result 都会进入本轮模型消息上下文，但不是预先存进 `UnifiedContext` 的
+同名字段。`UnifiedContext` 保存 `conversation_history`、`knowledge_bases`、
+`memory_context` 等本轮输入；Agent Loop 再根据这些输入构造并持续扩展本轮 `messages`。
+
+RAG 有两条进入模型输入的路径：
+
+1. 有已选知识库时，Loop 开始前对最多 3 个 KB 并发检索，每个 KB 的证据正文最多保留
+   4000 字符，并作为 KB Seed 拼到本轮末尾的 user message，因此第一次 LLM 调用就能看到。
+2. 模型在 Loop 中主动调用 `rag` 时，检索正文作为 `ToolResult.content` 被转换为
+   `role=tool` message；其他普通工具也使用相同协议，下一轮 LLM 读取结果后继续推理。
+
+“入库”需要区分不同对象：
+
+| 对象 | 是否持久化 | 后续模型是否自动复用 |
+| --- | --- | --- |
+| 知识库原文和索引 | 是，属于 KB 自身存储 | 后续重新检索后使用 |
+| 自动 KB Seed 的证据正文 | 不作为对话正文或独立 Tool Result 保存 | 否；下一轮需要重新检索 |
+| Agent 主动调用产生的 Tool Result | 作为 assistant 的 `events_json`、`turn_events` 和 workspace 事件轨迹保存 | 否；默认历史构造不读取事件正文 |
+| 最终 assistant 回答 | 作为普通 assistant message 保存 | 是；可进入后续历史或会话摘要 |
+| RAG Memory Trace | 只记录 query、KB 名称和结果字符数 | 可作为 L1 行为证据，但不包含检索 passage |
+
+因此 `role=tool` 只在当前 Agent Loop 的内存消息列表中存在，不会作为 `messages` 表的一条
+独立历史消息保存。`ContextBuilder` 重建下一轮上下文时只读取 user/assistant/system 的
+正文，不读取 `events_json`；Chat L1 Snapshot 同样不吸收 Tool Result 事件。工具若自身具有
+持久化副作用，例如 `write_memory`、`write_note` 或生成文件，则由对应 Service 保存业务结果，
+不能据此推导所有 Tool Result 都会自动进入长期记忆。
+
+当前 Loop 接近上下文窗口的 90% 时，还会优先把早期 `role=tool` 正文替换为裁剪提示。这进一步
+说明 Tool Result 是本轮工作记忆，而不是稳定长期记忆。准确概括是：**本轮原文回填、事件轨迹
+持久化、跨轮不直接复用、长期记忆不自动吸收。**
+
+**设计建议，不代表当前已实现：**生产系统不宜在“全部入库”和“完全不入库”之间二选一，
+更合理的是按用途选择性持久化：
+
+| 层次 | 推荐保存内容 | 推荐策略 |
+| --- | --- | --- |
+| Tool 运行审计 | tool/call id、脱敏参数、状态、耗时、错误、结果摘要或对象引用 | 短期或按合规周期保存；大结果不直接塞数据库 |
+| Tool 业务副作用 | 写入的 Memory、Note、文件、任务等领域对象 | 由对应 Service 作为权威数据长期保存 |
+| RAG 检索追踪 | query、KB、retriever/mode、index version、Top-K 的 chunk id/rank/score/content hash、耗时 | 独立 Retrieval Trace 保存，支持评测、回归和问题定位 |
+| RAG 证据正文 | 通常不重复保存全文，只保存 Chunk 引用 | 语料可变且要求复现时，再保存快照或不可变版本引用 |
+| 长期用户画像 | 从结果中验证出的稳定用户事实及来源引用 | 经过抽取、冲突检查和置信度门槛后选择性晋升，禁止原样灌入 |
+
+对当前 DeepTutor，`RAGService` 的 L1 Trace 只有 query、KB 名称和结果字符数，不能独立复现
+当时的 Top-K；主动 RAG Tool 的完整 metadata 虽在事件轨迹中，但自动 KB Seed 没有等价的
+候选明细持久化。若要支撑线上 Recall 回放与检索回归，建议新增统一 `RetrievalTrace`，记录
+稳定 Chunk 引用和索引/检索配置，而不是依赖聊天消息或复制 passage 全文。Tool Result 也应
+采用“短结果内联、大结果对象存储加引用、敏感字段脱敏或不存”的策略。
+
+一种可直接落地的关系模型是：
+
+```text
+tool_executions
+  id, session_id, turn_id, tool_call_id, tool_name,
+  redacted_args_json, status, latency_ms,
+  result_preview, result_ref, error_code, created_at
+
+rag_retrievals
+  id, session_id, turn_id, query, kb_id,
+  retriever_mode, index_version, top_k, latency_ms, created_at
+
+rag_retrieval_items
+  retrieval_id, rank, chunk_id, score, content_hash, source, page
+```
+
+一次 Tool 调用开始时可插入 `running` 记录，结束后更新状态、耗时和结果引用；RAG 则在一次
+query 记录下保存多条候选 item。短小且安全的结果可内联 preview，较大的 JSON、网页正文或
+执行产物写对象存储/文件存储，数据库只保存 `result_ref + hash + size + TTL`。知识库原文、
+Chunk 和向量索引继续由 KB/Vector Store 管理，用户画像只接收经过验证后的抽取事实。
+
+当前 DeepTutor 尚未采用上述专表：SQLite 把 Tool 相关 StreamEvent 同时保存在 assistant
+message 的 `events_json` 与 `turn_events`，并镜像到 workspace 的 `events.jsonl`；KB 原文和
+索引使用知识库目录/version 存储，Memory Trace 使用按日 JSONL。因此这是对现有事件存储的
+结构化生产改造建议，而不是当前数据库 schema 的描述。
+
+简历中不宜写成“UnifiedContext 内直接存放 RAG 和 Tool Result”，更准确的说法是：
+
+> 基于 UnifiedContext 承载近期对话、用户画像与知识库选择，并在 Agent Loop 中按需注入
+> RAG 证据和 Tool Result，通过历史摘要、结果裁剪与优先级控制治理模型上下文。
+
+关键证据：
+
+- `deeptutor/core/context.py:34-84`
+- `deeptutor/agents/chat/agent_loop.py:163-205,346-400`
+- `deeptutor/agents/chat/agentic_pipeline.py:360-401,1015-1085,1152-1188`
+- `deeptutor/core/agentic/tool_dispatch.py:492-568`
+- `deeptutor/services/session/turn_runtime.py:1579-1659,1661-1720,1987-2019`
+- `deeptutor/services/session/sqlite_store.py:133-147,762-815,1211-1267`
+- `deeptutor/services/rag/service.py:150-166`
+- `deeptutor/services/memory/snapshot/adapters.py:395-442`
+
+#### 跨 Session 原文回忆：三层记忆之外的按需检索
+
+**状态：已验证当前能力缺口；以下工具方案属于设计建议，尚未接入普通 Chat**
+
+当前 Chat 的 L1 粒度是一条 `Entity` 对应一个 Session，`content` 中包含该 Session 的
+用户/助手消息，`metadata` 中保存 `session_id` 和消息数量。但当前 L2 并不是“每条 L1
+固定生成一条 Session 摘要”：L2 Update 会把未处理的 L1 Entity 分块交给模型抽取事实，
+随后进行去重和合并，最终保存为 `L2/chat.md`。因此，**现有 L2 是带来源引用的事实文档，
+还不是可以按 Session 直接执行 SQL 查询的摘要表**。
+
+当前 `read_memory` 是无参数工具，只调用 `MemoryStore.read_l3_concat()` 返回 recent、
+profile、scope、preferences 四份 L3；它不会查询 L1/L2，也不会根据用户当前问题搜索
+历史 Session。`ContextBuilder` 同样只压缩当前 Session 的摘要和近期消息。
+
+产品已经支持用户显式选择旧会话：请求携带 `history_references` 后，`turn_runtime`
+会通过 Session Store 读取该会话并将 transcript 作为 Source 注入。但这是“用户先选中
+哪段历史”，不是 Agent 在听到“我上次提过的那件事”后自主定位历史。Partner 模块已有
+`partner_search`，能够跨 Partner 的全部会话做关键词搜索并返回标题、角色、时间和片段，
+但它被限制在 Partner 存储中，普通产品 Chat 不能直接调用。
+
+如果目标设计中的 L2 确实是“每个 Session 的可检索摘要”，则不需要增加 L4，也不必
+一开始就在 L1 原文上建立全文索引。更合适的是让 L2 承担轻量索引，让 L1 保留原始证据，
+形成**情景记忆（episodic recall）访问路径**：
+
+```text
+稳定偏好、画像、知识状态
+  -> read_memory / L3
+
+“上次、之前、我说过的……”等具体历史指代
+  -> recall_conversation
+  -> 按用户、时间、主题、实体等条件查询 L2 摘要
+  -> 根据 L2 的来源引用定位 L1 Session / 消息
+  -> 读取命中消息前后的相邻对话作为证据
+  -> 把小段原始证据回填 Agent
+```
+
+首版可以设计成一个工具：
+
+```text
+recall_conversation(
+  query: string,
+  time_hint: string | null = null,
+  limit: int = 5,
+  context_messages: int = 2
+)
+```
+
+目标 L2 记录至少需要 `user_id`、`session_id`、摘要、主题/实体、发生时间，以及
+`source_message_ids` 或起止消息 id。只有 `session_id` 时可以定位会话，但无法准确回到
+“那一句”及其邻域；消息级来源引用是从摘要回溯原文的关键。`current_user_id` 与
+`current_session_id` 必须由 Runtime 私下注入，并限制候选数和回填字符数，避免跨用户
+读取和整段历史重新进入 Prompt。
+
+在用户历史规模不大、L2 已有主题/实体/时间等结构化字段时，首版不需要 FTS5/BM25：
+先用 SQL 条件筛选出少量候选，再按字段匹配度、新鲜度打分，或让模型只对前 20～30 条
+L2 摘要重排即可。需要注意，“存进数据库”只解决持久化，不会自动解决相关性排序；
+如果只有一列自然语言摘要并使用 `%LIKE%`，同义改写仍可能漏召回，数据量增大后也会产生
+全表扫描。此时再把 FTS5/BM25 或 Embedding 作为候选召回增强，而不是首版硬依赖。
+
+BM25 是一种基于关键词的相关性排序算法。它主要同时考虑：查询词在当前文档中出现的
+次数、该词在全部文档中的稀有程度，以及文档长度；同一个词重复出现时收益会逐渐饱和，
+长文档也会受到长度归一化，避免单纯因为字数多而排名靠前。可以口语化理解为：
+“查询词在这条摘要里比较突出，并且在其他摘要里不常见，这条摘要就更值得排在前面。”
+它不理解真正的语义，因此“考研”和“研究生入学考试”未必能够互相命中。FTS5 是
+SQLite 提供的全文索引能力，BM25 是 FTS5 可用于结果排序的评分方式，两者不是同一个概念。
+
+当前实现要走这条路线，需要先把 L2 从单个 Markdown 事实文档扩展为可查询的 Repository/
+表，并在 L2 生成时保存 Session 和消息级来源引用；Tool 依赖 Repository 接口，而不直接
+依赖 SQLite。命中后再通过现有 Session Store 回取 L1 原文。读取相邻消息时还需尊重
+`parent_message_id` 分支，避免把 regenerate 产生的兄弟分支混入同一段上下文。
+
+关键证据：
+
+- `deeptutor/tools/builtin/__init__.py:633-660`
+- `deeptutor/services/memory/store.py:72-84`
+- `deeptutor/services/memory/snapshot/adapters.py:395-458`
+- `deeptutor/services/memory/consolidator/modes/update.py`
+- `deeptutor/services/memory/paths.py`
+- `deeptutor/services/session/context_builder.py:104-178,341-446`
+- `deeptutor/services/session/turn_runtime.py:1243-1248,1473-1534`
+- `deeptutor/services/session/protocol.py:14-83`
+- `deeptutor/services/session/sqlite_store.py:123-157,1159-1416`
+- `deeptutor/tools/partner_memory.py:225-310`
 
 #### 三层记忆分别在什么时候使用
 
@@ -674,6 +900,88 @@ L1 Refresh 会显示 modified，但普通 L2 Update 不会因此重新抽取该 
 对话若需要个性化信息，`turn_runtime` 读取 L3 并注入 `UnifiedContext`，或者由
 Agent 调用 `read_memory` 读取。也就是说，L1/L2 主要支撑“记忆生成、审计和追溯”，
 L3 主要支撑“对话时使用”。
+
+#### 与 LangChain / LangGraph 的边界：编排框架不等于记忆模型
+
+**状态：已验证当前代码边界；选型结论属于设计判断**
+
+截至当前代码，`pyproject.toml`、`requirements/` 和 `deeptutor/` 没有把
+LangChain 或 LangGraph 作为运行时依赖。DeepTutor 已有自己的运行时边界：
+`deeptutor/runtime/orchestrator.py` 通过 Capability Registry 路由回合，
+`deeptutor/core/context.py` 的 `UnifiedContext` 是 CLI、WebSocket 和 SDK 共用的
+请求上下文，`deeptutor/core/agentic/loop.py` 负责 Agent Loop；记忆侧则由
+`MemoryStore`、Snapshot、Trace 和 `consolidator` 分工完成。
+
+面试中不应回答“LangChain/LangGraph 不好”，而应说明**问题层次不同**：
+
+| 组件 | 擅长解决的问题 | 在本项目中的边界 |
+| --- | --- | --- |
+| LangChain | Prompt、模型、Tool、Retriever 等通用组件组合 | 不能直接定义 L1 证据、L2 场景事实、L3 用户模型及来源关系 |
+| LangGraph | 有状态图、分支、暂停恢复、checkpoint 和持久化执行 | checkpoint 是工作流执行状态，不等于跨回合语义记忆；仍需独立的记忆数据模型和读取策略 |
+| DeepTutor Memory | Snapshot/Trace 证据、L2/L3 增量归并、引用校验、原子写入和按用户隔离 | 这是领域数据与生命周期，不是某个 Agent 框架的默认能力 |
+
+因此当前选择是让记忆的 source of truth 保持在 DeepTutor 自己的存储和协议中，
+避免把框架 checkpoint、对话 history 和长期记忆混为一层，也避免为了一个简单的
+归并链路引入额外依赖和第二套状态模型。代价是重试、幂等、可观测性等基础设施需要
+自己维护；这些约束已经体现在 `consolidator/modes/update.py` 的增量集合、
+`consolidator/meta.py` 的 `seen_*` 元数据以及 `MemoryStore` 的原子写入路径中。
+
+这不是永久排斥框架：若未来某个能力需要复杂分支、人工确认或长时间暂停恢复，可以
+用 LangGraph 编排该能力的节点，并把 L1/L2/L3 当作自定义 `MemoryStore` 节点访问；
+框架只负责 workflow，不能取代记忆的 schema、provenance、冲突策略和评测。若引入，
+应先以适配器隔离，并用延迟、失败恢复、token 成本、记忆准确率和可追溯性做对比评测。
+
+#### LangChain / LangGraph 的记忆实现模型
+
+**状态：已根据 LangChain 官方 Python 文档核对（2026-08-23）；以下不是 DeepTutor 当前实现**
+
+当前生态需要区分两代概念：旧版 LangChain 有 `ConversationBufferMemory`、
+`ConversationSummaryMemory` 等 `BaseMemory` 类；它们通常在一次链调用前加载历史，
+在调用后通过 `save_context` 写回消息或摘要。现在的 LangChain agent 主要建立在
+LangGraph runtime 上，短期记忆推荐使用 checkpointer，而不是把旧版 Memory 类当成
+长期用户画像。
+
+**LangChain 的基础消息历史。** `BaseChatMessageHistory` 抽象负责保存消息，后端可以
+是进程内列表，也可以接 Redis、SQL 等实现；`RunnableWithMessageHistory` 用调用配置中的
+`session_id` 找到对应 history，把历史放入 `MessagesPlaceholder`，执行 Runnable 后再把
+本轮输入和输出追加回 history。这条链路解决的是“同一会话继续对话”，不自动做事实抽取、
+跨会话用户画像、来源引用或冲突消解。旧版 `Conversation*Memory` 的 buffer/window/
+summary/vector 差别，本质也是“如何加载和压缩消息”，而不是完整的领域记忆模型。
+
+**LangGraph 的短期记忆。** 图有一个可持久化的 State，通常包含 `messages` 等字段；
+编译图时传入 checkpointer，调用时传 `configurable.thread_id`。每个 graph superstep
+会生成 checkpoint，保存该 thread 的状态、元数据、版本和必要的 writes。下一次使用同一
+`thread_id` 时，图从最近 checkpoint 恢复；换 thread 就是另一段会话。内存版
+`InMemorySaver` 适合演示，生产环境可换 SQLite/Postgres 等 checkpointer。它同时支撑
+中断恢复、故障重试、历史回放和 time travel，但保存的是**工作流状态**。
+
+短期记忆不会自动无限增长。`messages` 若接近模型窗口，需要由应用或 middleware
+显式 trim、删除旧消息，或先调用模型生成 summary 再把旧消息压缩；checkpointer 只负责
+可靠保存状态，不替应用决定摘要内容。
+
+**LangGraph 的长期记忆。** 跨 thread 的数据应放在独立的 Store 中，而不是塞进某个
+thread checkpoint。应用使用 `(user_id, "memories")` 一类 namespace 和 key/value
+保存 JSON 记忆，例如 `store.put(namespace, key, value)`；需要个性化时用
+`store.get` 精确读取，或 `store.search` 做查询感知召回。Store 可以配置 embedding
+建立语义索引，也可以只做精确 key 查询。何时写入、写什么、如何更新旧事实、是否失效，
+通常由节点、middleware 或模型调用的 memory tool 决定，框架不会凭空完成 L1/L2/L3
+式的证据归并。
+
+可以把两者记成下面的边界：
+
+```text
+checkpointer + thread_id  -> 当前线程的 workflow state / 短期对话记忆
+Store + user namespace    -> 跨线程长期数据 / 可选语义召回
+应用逻辑或 memory tool    -> 抽取、去重、冲突、过期和写入策略
+```
+
+因此，LangGraph 的 `MemorySaver` 不是 DeepTutor L3 的替代品；它更接近“这次图运行到
+哪一步、当前消息状态是什么”。若用 LangGraph 承载 DeepTutor，应让 graph 节点调用
+`MemoryStore` 读写 L1/L2/L3，同时独立使用 checkpointer 保存 workflow 恢复状态。
+
+官方参考：LangChain [Short-term memory](https://docs.langchain.com/oss/python/langchain/short-term-memory)、
+LangGraph [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence) 和
+[Memory](https://docs.langchain.com/oss/python/langgraph/add-memory)。
 
 #### Mem0 OSS 对照：条目化存储与查询感知召回
 
@@ -862,6 +1170,171 @@ L1 到 L3 的提炼和来源关系。
   `docs/changelog/sdk.mdx:322-343`
 - `learning/demos/memory_hybrid_demo.py`
 - `tests/learning/test_memory_hybrid_demo.py`
+
+### 5.7 BookEngine 的页面规划器：`SectionArchitect`
+
+**状态：已验证当前调用链；实现偏差单独标为待修正项**
+
+项目里没有一个供所有 Capability 共用的全局 `Planner`。当前最直接以 planner 命名的
+实现位于 `deeptutor/book/agents/page_planner.py`，它属于独立的 BookEngine，职责不是
+直接写出完整页面，而是把一个 `Chapter` 翻译成有顺序的 `Block` 骨架：决定 block 的
+`type`、生成参数 `params`，以及用于块间衔接的 `metadata["transition_in"]`。真正的正文、
+图、题目和代码随后才由 `BookCompiler` 按 block 类型查找对应 `BlockGenerator` 生成。
+
+当前真实调用链是：
+
+```text
+BookEngine.compile_page()
+  -> BookCompiler.compile_page()
+  -> _plan_if_needed()                 # 仅 page.blocks 为空时进入
+  -> SectionArchitect.plan_blocks_async()
+       -> LLM 规划成功：校验并构造 Block 骨架
+       -> 调用/解析/结果校验失败：退回静态模板
+  -> page.blocks 持久化
+  -> BookCompiler 逐块调用 BlockGenerator
+```
+
+`BookEngine` 默认创建 `CompilerOptions(phase=2)`；`BookCompiler` 再按
+`architect_llm_enabled` 构造 `SectionArchitect`，该开关默认是 `True`。规划前页面状态会
+写成 `PLANNING`，并发出 `page_planning`；规划完成后保存 blocks 并发出
+`page_planned`。因为 `_plan_if_needed()` 发现 `page.blocks` 已存在就直接返回，所以普通
+恢复和单页 `force` 重生成会复用原 block 结构；只有删除/重建页面等路径才会重新规划。
+
+LLM 规划只调用一次模型。提示词来自
+`deeptutor/book/prompts/{en,zh}/page_planner.yaml`，输入包括章节标题、摘要、
+`ContentType`、学习目标，以及 `ExplorationReport.summary`；当前并没有把完整
+`ExplorationReport.chunks` 直接塞给规划器。模型应返回 `{"blocks": [...]}`。服务端随后：
+
+- 最多读取前 12 项，只接受 `_ALLOWED_LLM_TYPES` 中的类型；
+- 丢弃非法类型，把非字典 `params` 归一为空字典；
+- 把 `focus` 和 `transition_in` 截断到 240 字符；
+- 若最终一个 block 都没有，则整体退回静态模板；
+- 若结果中没有 `section`，在 `phase >= 1` 时自动在最前面补一个核心 `section`，防止
+  页面失去承担长文讲解的主体块。
+
+静态兜底由 `_TEMPLATES_V2` 提供，按 `ContentType.THEORY / DERIVATION / HISTORY /
+PRACTICE / CONCEPT` 选择确定性的 block 序列，并把章节标题、摘要、学习目标和来源锚点
+合并进每个 block 的 `params`。因此模型服务不可用或 JSON 不合法时，页面仍能获得一个
+可执行的内容结构，而不是整页直接失败。
+
+`PagePlanner` 这个名称目前只是向后兼容类：它继承 `SectionArchitect`，但构造时强制
+`llm_enabled=False`，所以只走静态模板。当前 `BookCompiler` 已直接导入并使用
+`SectionArchitect`。学习源码时可以把它记成：**旧名叫 PagePlanner，当前活跃实现叫
+SectionArchitect；它规划页面结构，不生成 block 内容。**
+
+#### 已验证的待修正项
+
+1. `CompilerOptions.phase`、`SectionArchitect` 注释声称 phase 1 只输出有限 block 类型，
+   但 `_static_plan()` 当前完全没有使用收到的 `phase`，`_PHASE1_TYPES` 和
+   `_PHASE1_SUBSTITUTES` 也没有进入任何过滤路径；LLM 路径的允许类型同样不按 phase
+   缩减。因而现状是 phase 1 与 phase 2 都可能产生 figure、code、animation 等块。
+2. Prompt 要求“5-10 个 block、追求多样性”，这是软约束。Python 侧只截取前 12 项，
+   没有强制最少 5 项、最多 10 项或禁止重复类型。
+3. `tests/book/` 当前没有针对 `SectionArchitect/PagePlanner` 的直接单元测试；上述 fallback、
+   JSON 清洗、section 保底以及 phase 语义缺少专门的回归保护。
+
+不要把这里的页面规划器和 `deep_solve` 混为一谈。当前 `deep_solve` 已没有独立
+`PlannerAgent`：`DeepSolveCapability` 复用 chat agent loop，由模型调用 `solve_plan`、
+`solve_finish_step`、`solve_replan` 三个工具维护单回合的 `SolveSession`。`deep_question` 和
+`deep_research` 也各自在自己的 pipeline 中包含 planning 阶段，它们都不调用
+BookEngine 的 `SectionArchitect`。
+
+关键证据：
+
+- `deeptutor/book/agents/page_planner.py:40-364`
+- `deeptutor/book/prompts/zh/page_planner.yaml`
+- `deeptutor/book/compiler.py:54-84,95-165,305-343`
+- `deeptutor/book/engine.py:101-114,699-756,769-856`
+- `deeptutor/book/models.py:83-91,323-376`
+- `deeptutor/book/streaming.py:22-31`
+- `deeptutor/capabilities/solve/capability.py:1-91`
+- `deeptutor/capabilities/solve/session.py:1-97`
+- `deeptutor/capabilities/solve/tools.py:1-287`
+
+### 5.8 RAG 的可量化执行口径
+
+**状态：已验证当前代码与默认配置；业务数据和效果指标仍待真实报表验证**
+
+当前 RAG Factory 注册 **5 类后端**：LlamaIndex、PageIndex、GraphRAG、LightRAG 和
+LightRAG Server。知识库创建时会绑定一个 provider，后续追加文档和检索继续使用同一条
+pipeline。文档接入侧另有 **5 类解析引擎**；`FileTypeRouter` 的静态集合共覆盖
+**116 种扩展名**，其中包括 4 种交给解析器的 PDF/Office 类型、104 种直接读取的
+文本或代码类型，以及 8 种图片类型。这里的数量描述的是平台接入面，不等于 116 种格式
+都具有相同的解析质量。
+
+默认 LlamaIndex 配置采用 hybrid profile：chunk size 为 **512 Token**、overlap 为
+**50 Token**，最终 `top_k=5`，Vector 和 BM25 的候选倍率均为 2。因此默认执行语义是
+“Vector 取 Top 10、BM25 取 Top 10，再经 RRF 融合返回 Top 5”，不是先后串行调用两个
+Retriever，也不能据此声称 Recall 提升了某个百分比。
+
+三部分的职责不同：Dense Embedding 将 Query 和 Chunk 映射为向量，擅长召回用词不同但
+语义相近的内容；BM25 根据关键词词频、稀有度和文档长度排序，擅长专有名词、公式、编号
+等精确词；RRF（Reciprocal Rank Fusion）不直接比较两路不可比的原始分数，而是按
+`sum(1 / (k + rank))` 累加名次分，某个 Chunk 在一路排名很高或在两路都进入前列时，
+融合分会更高。这里的 `k` 是平滑常数，不是最终返回数量 `top_k`。
+
+Recall@5 的严格口径是：对每条标注问题，检查返回前 5 个 Chunk 覆盖了多少人工标注的
+相关 Chunk，再对全部问题求平均。如果每题只有一个 gold Chunk，它实际等价于 Top-5
+命中率；600 题中 73% 和 86% 分别对应 438 题和 516 题命中，即多命中 78 题。若每题有
+多个 gold Chunk，则必须按 `命中的相关 Chunk 数 / 该题全部相关 Chunk 数` 逐题计算，
+不能把百分比直接换算成命中题数。73% 到 86% 是提升 13 个百分点，相对提升约 17.8%。
+
+要把“600 条标注问题上 Recall@5 从 73% 提升到 86%”写成实测结论，必须固定同一份语料、
+切块、问题集和 Top-5 口径，明确 73% 是 Dense-only 还是其他旧方案，并保留问题到 gold
+Chunk 的标注、两组逐题检索结果和评测脚本。当前仓库尚无这些评测产物，所以这组数字只能
+视为待业务报表验证的简历口径，不能由 hybrid 配置本身推导出来。
+
+600 条问题的抽样依据不应是“旧系统已经回答正确”，否则会产生幸存者偏差。合理做法是
+先定义一个固定时间窗口内所有触发 RAG 的脱敏有效 Query 作为候选池，去除寒暄、重复、
+缺少必要上下文和知识库中不存在证据的问题；再按照业务场景/学科、资料类型、问题意图以及
+检索难度分层随机抽样，并尽量保持主评测集与真实流量分布一致。检索难度至少应覆盖精确术语、
+语义改写、长问题和跨 Chunk 问题。入选条件是“知识库中存在可人工确认的 Gold Chunk”，
+而不是 Dense 基线已经命中；原系统未命中但确有证据的问题同样必须保留。
+
+评测集确定后不能再用它反复选择切块、TopK 或融合参数；调参应使用独立开发集，600 条作为
+冻结测试集，或者在报告中明确它只是验证集。600 不是算法要求，只是覆盖度、统计波动与人工
+标注成本之间的工程取舍。在命中率约 80%、样本近似独立随机的理想假设下，600 条对应的
+95% 置信区间半宽粗略约为 3.2 个百分点；实际分层、重复用户和问题相关性会改变该估计。
+
+检索结果不自动进入长期记忆，并不妨碍离线评测。评测 Harness 应直接调用固定版本的
+Retriever/Pipeline，为每条 Query 单独保存 `gold_chunk_ids`、Dense Top 5、Hybrid Top 5、
+每个候选的 `chunk_id/score` 和是否命中，形成独立 JSONL、数据库表或评测报告，而不是从
+聊天 Session 历史中反推。当前 LlamaIndex `_nodes_to_result()` 已返回 `chunk_id`、score、
+来源文件和页码，可以用于比对。由于重新切块或重建索引可能改变 `chunk_id`，必须冻结语料、
+切块配置和索引版本，或额外保存 `source + page + content_hash` 作为稳定 Gold 定位。
+
+面试中可以把这组数字解释为三层价值：5 类 provider 表示检索后端可替换，5 类解析引擎
+和 116 种扩展名表示异构资料接入范围，`10 + 10 -> Top 5` 表示默认候选扩召与证据收敛。
+仓库当前没有可复现的 Recall@5、MRR、nDCG、RAGAS、检索 P95 或教材总量报表；
+`891 本教材`属于简历业务自述，不能当作源码已验证事实。
+
+关键证据：
+
+- `deeptutor/services/rag/factory.py:27-42`
+- `deeptutor/services/config/runtime_settings.py:200-207`
+- `deeptutor/services/rag/pipelines/llamaindex/retrievers.py:132-146`
+- `deeptutor/services/parsing/engines/factory.py:22-65`
+- `deeptutor/services/rag/file_routing.py:34-177`
+
+### 5.9 Mastery Path 的量化学习规则
+
+**状态：已验证当前策略代码；这些数字是产品规则，不是线上转化效果**
+
+Mastery Path 按 memory、concept、procedure、design **4 类知识点**选择掌握策略。
+memory 和 procedure 使用 **90%** 的量化门槛；concept 和 design 不使用字符串准确率，
+而由 Tutor 通过 `mastery_assess` 记录定性通过。掌握分只看最近 **5 次练习**并让较新的
+结果权重更高；只有 1 次或 2 次证据时，得分上限分别是 50% 和 80%，避免一次幸运答对
+直接解锁知识点。
+
+间隔复习按知识类型使用不同序列：memory 最多推进到 **60 天**，其余类型采用更短序列；
+`get_due_tasks()` 单次默认最多返回 **5 个**到期任务。这些规则体现的是“有证据才推进、
+按类型安排复习”的业务机制，不能在没有用户实验数据时写成完成率或留存率提升。
+
+关键证据：
+
+- `deeptutor/learning/policy.py:34-63`
+- `deeptutor/learning/mastery.py:17-37`
+- `deeptutor/learning/scheduler.py:13-17,72-76`
 
 ## 6. 一次对话的主调用链
 
@@ -1294,6 +1767,92 @@ tool_choice = "auto"
 2. 与每个 tool_call 对应的 `role=tool` 结果。
 
 这就是 Agent 获得“观察结果”并继续决策的闭环。
+
+#### Tool Runtime 与并发执行的真实边界
+
+**状态：已验证**
+
+当前代码没有一个名为 `ToolRuntime` 的独立类。Tool 运行时职责由三层共同组成：
+
+1. `ToolRegistry` 是进程级工具目录。`get_tool_registry()` 首次调用时实例化
+   `BUILTIN_TOOL_TYPES` 并保存为 `name -> BaseTool 实例`；插件/MCP 工具也注册到这里。
+   它负责别名解析、schema 生成和 `await tool.execute(**kwargs)`，但不负责并发调度。
+2. `dispatch_tool_calls()` 是批次调度与协议适配层。它负责参数解析、服务端参数注入、
+   去重、最多 8 个的批次上限、并发执行、事件和 `role=tool` 结果封装。
+3. 每个 `BaseTool.execute()` 及其下游 Service 是真正执行层。RAG 可以等待异步检索，
+   `web_search` 用 `asyncio.to_thread()` 把同步搜索移出事件循环，`exec` 则进入
+   `SandboxService`，由异步 HTTP/子进程 backend 执行，并另受每用户 semaphore 与
+   每分钟速率配额限制。
+
+因此准确调用链是：
+
+```text
+模型返回 tool_calls[]
+  -> AgentLoop 把 assistant(tool_calls) 写入 messages
+  -> dispatch_tool_calls()
+       -> 截断 / 解析 / 注入私有参数 / 批内去重
+       -> 为每项构造 _run_one(i) 协程
+       -> await asyncio.gather(*coroutines)
+            -> execute_tool_call()
+                 -> ToolRegistry.execute(name, **args)
+                      -> BaseTool 子类实例.execute(**args)
+       -> _collect_outcome()
+            -> TOOL_RESULT 事件
+            -> role=tool 消息
+            -> sources / pause / terminate
+```
+
+这里不是在普通 `for` 循环中逐个 `await`。下面两段语义不同：
+
+```python
+# 串行：a 完成后才启动 b
+a = await run_a()
+b = await run_b()
+
+# 并发：a/b 一起进入事件循环，本协程等待整批结束
+a, b = await asyncio.gather(run_a(), run_b())
+```
+
+`asyncio.gather()` 本身提供的是单事件循环上的协作式并发，不会自动创建 8 个 CPU 线程。
+当某个工具等待 HTTP、数据库、异步子进程等 I/O 时，它让出控制权，事件循环才会推进其他
+工具；若某个 `async def execute()` 内部直接运行长时间同步 CPU/阻塞 I/O，仍会卡住整个
+事件循环。同步工具需要像 `WebSearchTool` 一样使用 `asyncio.to_thread()`，或交给外部
+进程/服务，才能保留批次并发效果。
+
+当前批次还有几个容易误解的细节：
+
+- “8 个”是**单次模型回复、单次 dispatch 的上限**，不是进程或全系统的全局上限；
+  dispatcher 没有跨 turn 的全局 semaphore，不同 turn 可以各自发起一批。具体工具服务
+  可以再施加自己的限流，例如 Sandbox 的每用户并发和速率配额。
+- 执行前的 `TOOL_CALL` 事件先按输入顺序逐个 `await` 发出，然后才进入 `gather()`；真正的
+  `tool.execute()` 阶段才并发。
+- `gather()` 返回结果时保持输入顺序，不按实际完成顺序排列。当前 `_collect_outcome()` 在
+  整批 gather 完成后才按该顺序发送最终 `TOOL_RESULT`，因此一个快速工具的最终结果事件
+  可能要等同批最慢工具结束；支持 `event_sink` 的长任务仍可在执行中发送进度事件。
+- 普通工具异常会在 `execute_tool_call()` 内转换成 `success=False` 的工具结果，所以通常
+  不会让 `gather()` 因单个工具异常取消整个批次；下一轮模型能读到错误并调整策略。
+- 批内同名同参数调用只真正执行第一项，后续项产生占位 `role=tool` 结果；`ask_user`
+  在同批中无论参数是否相同，也只保留第一个暂停请求。
+
+#### 已验证的 8 项截断协议风险
+
+Chat Loop 当前先把模型返回的**全部** `result.tool_calls` 写入 assistant message，随后
+`dispatch_tool_calls()` 才在内部截断为前 8 项。于是模型若一次产生超过 8 个 call，
+`messages` 中第 9 项之后仍有 assistant tool-call 声明，却没有对应的 `role=tool` 结果；
+严格遵守 OpenAI tool-call 配对协议的 Provider 可能在下一轮拒绝这份消息。当前测试也没有
+覆盖超过 8 项的 Chat 回填场景。较稳妥的修正方向是在写 assistant message 前统一裁剪，
+或为被裁剪的每个 call 补一条“超过上限、未执行”的占位 `role=tool` 结果。
+
+关键证据：
+
+- `deeptutor/runtime/registry/tool_registry.py:21-163`
+- `deeptutor/core/tool_protocol.py:122-208`
+- `deeptutor/core/agentic/tool_dispatch.py:84-201,337-573`
+- `deeptutor/agents/chat/agent_loop.py:333-356`
+- `deeptutor/tools/builtin/__init__.py:87-156`
+- `deeptutor/tools/exec_tool.py:64-137`
+- `deeptutor/services/sandbox/service.py:29-96`
+- `deeptutor/services/sandbox/quota.py:22-75`
 
 #### 工具执行日志
 
@@ -1823,6 +2382,53 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-30
+
+- 补充 5.6 节跨 Session 情景记忆边界：确认当前 Chat L1 是按 Session 构造 Entity，
+  当前 L2 则是 Markdown 事实文档，并非一对一的数据库摘要表；记录“L2 定位、L1 取证”
+  的 `recall_conversation` 设计、消息级来源引用、结构化 SQL 筛选与候选重排方案，并将
+  FTS5/BM25 或 Embedding 明确为规模扩大后的可选召回增强。
+- 补充 5.6 节广义用户画像边界：对外可用“用户画像”统称全部 L3，内部仍以 `profile`、
+  `recent`、`scope`、`preferences` 管理不同维度；区分各维度的更新触发、时效和 Agent
+  用途，并明确差异化更新频率是推荐设计而非当前已实现的自动调度；补充“同表按 slot
+  分行、组合读取”原则。
+- 补充 5.6 节 RAG/Tool Result 上下文与持久化边界：确认二者由 Agent Loop 动态加入本轮
+  messages，而非预存于 UnifiedContext；记录 Tool Result 事件持久化、跨轮不自动回放、
+  不自动进入长期记忆，以及 KB Seed 和主动 RAG Tool 两条证据注入路径；补充 Tool 审计、
+  领域副作用、Retrieval Trace、证据引用和画像晋升的选择性持久化建议，并给出 Tool/RAG
+  关系表与大结果对象引用的落地模型。
+- 补充 5.8 节混合检索指标口径：说明 Dense、BM25 与 RRF 的互补关系、RRF 排名融合公式、
+  Recall@5 在单/多 gold Chunk 下的不同算法，以及 600 条评测集的分层抽样、防幸存者偏差、
+  防调参泄漏原则和需要保留的自证材料；明确评测结果应独立保存并按稳定 Chunk 标识比对，
+  不依赖 RAG passage 是否进入聊天长期记忆。
+
+### 2026-08-29
+
+- 新增 5.7 节，追通 BookEngine 页面规划链路，明确 `SectionArchitect` 只生成 block 骨架、
+  `BookCompiler` 才负责逐块生成，以及 LLM-first、静态模板 fallback、持久化与事件边界。
+- 区分兼容类 `PagePlanner`、当前 `SectionArchitect` 和 `deep_solve` 的工具化规划机制；记录
+  `phase` 未实际过滤 block 类型、Prompt 数量/多样性约束未被代码硬校验和缺少直接单测等
+  已验证的待修正项。
+- 深化 6.7 节的 Tool 执行链：区分 `ToolRegistry`、批次 dispatcher 与具体 Service
+  运行时，说明 `asyncio.gather()` 的协作式 I/O 并发、事件与结果顺序、工具级二次限流，
+  并记录超过 8 项时 assistant tool-call 与 `role=tool` 可能失配的协议风险。
+- 新增 5.8 节，记录 5 类 RAG 后端、5 类解析引擎、116 种扩展名以及默认
+  `512/50` 切块、双路 Top 10 经 RRF 收敛为 Top 5 的可核验口径，并明确这些配置不能
+  替代 Recall、延迟或教材规模等真实评测。
+- 新增 5.9 节，记录 4 类知识点、90% 量化门槛、最近 5 次练习加权、低样本置信度上限
+  和最长 60 天复习周期，区分产品学习规则与线上业务效果。
+
+### 2026-08-23
+
+- 在 5.6 节补充 LangChain/LangGraph 与 DeepTutor Memory 的职责边界：前者是组件或
+  工作流编排，后者负责 L1/L2/L3 领域数据模型、来源追溯和增量生命周期；记录当前
+  运行时依赖与 `MemoryStore`、`UnifiedContext`、`AgentLoop` 的自有边界，并补充可在
+  未来通过适配器选择性引入 LangGraph 的评估口径。
+- 补充 LangChain 旧版 `BaseMemory`/消息历史与当前 LangGraph checkpointer、Store 的
+  实现模型：前者解决会话消息加载与写回，后两者分别负责 thread 级 workflow state
+  持久化和跨 thread 长期数据；明确 trim/summary、namespace、语义搜索以及应用自行
+  决定抽取、去重和冲突策略的边界。
 
 ### 2026-08-22
 

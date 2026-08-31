@@ -57,7 +57,13 @@ WebSocket 收到 start_turn
 CLI 和 Python SDK 先经过 `DeepTutorApp.start_turn()`，之后也进入同一个
 `TurnRuntimeManager.start_turn()`。
 
-## `ChatOrchestrator` 与 `ChatCapability` 口述版
+## Agent 主调用链口述版
+
+### 30秒版本
+
+> 用户消息经过 `TurnRuntimeManager` 组装成 `UnifiedContext`，交给 `ChatOrchestrator` 路由到 `ChatCapability`，再由 `AgenticChatPipeline` 创建 `AgentLoop`。`AgentLoop` 在一个不断增长的 messages 列表上循环调用 LLM：有 `tool_calls` 就执行工具并回填 `role=tool` 结果继续下一轮，没有 `tool_calls` 就作为最终回答，所有事件通过 `StreamBus` 流式返回前端。
+
+### 90秒版本
 
 > 用户发起一次对话后，请求会先进入 `TurnRuntimeManager`。它负责创建回合，
 > 收集历史消息、Memory、Skill 和附件等数据，并组装成 `UnifiedContext`。
@@ -69,11 +75,26 @@ CLI 和 Python SDK 先经过 `DeepTutorApp.start_turn()`，之后也进入同一
 > Pipeline 再组装工具、Prompt 和模型客户端，最后创建 `AgentLoop` 执行多轮
 > LLM 与工具调用。
 
-一句话区分：
+### 3分钟版本 
+
+> 用户通过 WebSocket、CLI 或 SDK 发起对话后，请求先进入 `TurnRuntimeManager.start_turn()`。它在后台任务中收集历史消息、Memory 摘要、Skill Manifest、附件等数据，组装成统一的 `UnifiedContext`，这个 Context 包含了本回合所需的全部输入。
+>
+> 数据准备完成后交给 `ChatOrchestrator.handle()` 统一调度。Orchestrator 做三件事：从 `CapabilityRegistry` 根据 `active_capability` 选择能力（默认是 `chat`），创建并管理本回合的 `StreamBus` 用于流式事件输出，以及在回合结束时发送 `DONE` 并关闭 bus。
+>
+> 对于默认 Chat 场景，Orchestrator 调用 `ChatCapability.run()`。`ChatCapability` 是一个很薄的入口层，它不负责路由和模型循环，只负责创建 `AgenticChatPipeline` 并把 context 和 bus 传下去。
+>
+> `AgenticChatPipeline` 负责组装：从 context 提取可用工具并生成 Schema，构建 System Prompt（包含 Memory、Skill Manifest、工具列表），选择模型客户端，最后创建 `AgentLoop` 并传入这些配置。
+>
+> `AgentLoop.run()` 是真正的多轮执行引擎。它在一个不断增长的 messages 列表上循环调用 LLM：如果返回 `tool_calls`，就并行执行工具、将结果以 `role=tool` 回填到 messages，然后继续下一轮；如果没有 `tool_calls` 且有正文，就作为最终回答结束；如果既没有 `tool_calls` 又没有正文，追加纠正提示重试一次。所有 LLM 输出和工具执行事件都通过 `StreamBus` 流式返回调用方。
+>
+> 异常情况下，比如达到最大轮次或 LLM 中途失败，`AgentLoop` 会禁用工具 Schema 并强制调用一次 LLM 尝试收尾，保证回合有明确结果。
+
+### 一句话区分
 
 ```text
 ChatOrchestrator：选择谁处理，并管理回合事件流。
 ChatCapability：接住 chat 请求，并把它交给 Chat Pipeline。
+AgentLoop：在不断增长的 messages 上循环 LLM，直到没有 tool_calls。
 ```
 
 ## WebSocket、SSE 和 `done`
