@@ -1400,6 +1400,41 @@ deeptutor/runtime/orchestrator.py
 
 异常策略也在这一层统一处理：Capability 抛出的异常会被记录，并转换成 StreamBus 错误事件，而不是直接让所有消费者各自处理一遍。
 
+#### 当前源码与“鼎校伴学口述口径”的边界
+
+**状态：已验证当前源码；TurnOrchestrator/ChatPipeline 是简历项目口径，不是当前类名**
+
+当前 DeepTutor 源码使用 `ChatOrchestrator -> CapabilityRegistry -> ChatCapability ->
+AgenticChatPipeline -> AgentLoop`：Orchestrator 支持多个 Capability，默认值才是 `chat`；
+`ChatCapability.run()` 则把 Context 交给 `AgenticChatPipeline`。因此不能把当前源码说成
+只有一条 Web Chat 链，也不能把源码类直接称为 `TurnOrchestrator` 和 `ChatPipeline`。
+
+鼎校伴学简历口径已经收敛为另一条更薄的链路：
+
+```text
+Turn Runtime -> UnifiedContext -> TurnOrchestrator
+             -> ChatPipeline -> AgentLoop
+```
+
+其中 `TurnOrchestrator` 只负责调度、Stream、异常边界和 `DONE`；`ChatPipeline` 只做
+System Prompt、messages、工具 Schema、模型参数和预算等确定性准备；不再保留 Capability
+路由，也不在 Agent Loop 前额外调用 LLM 做意图分类。真正的意图判断由 Agent Loop 第一轮
+统一完成：无 Tool Call 就直接回答，需要已有业务入口就调用受控的 Action Tool，需要教材、
+题库或 OCR 就调用对应工具。这样 Tool Selection 与 Agent 决策是同一次模型推理。
+
+如果未来把这一口径移植到当前仓库，可把现有 Orchestrator 的多 Capability 路由职责裁掉，
+将其收敛为 Turn 级协调器；把 `AgenticChatPipeline` 简化为 `ChatPipeline`；Action 则作为
+受 Tool Schema 和服务端 Action Registry 约束的普通 Tool 接入 Agent Loop。以上是目标架构
+建议，不是当前 DeepTutor 已实现的行为。
+
+关键证据：
+
+- `deeptutor/runtime/orchestrator.py:39-55`
+- `deeptutor/agents/chat/capability.py:25-27`
+- `deeptutor/agents/chat/agentic_pipeline.py:301-329`
+- `deeptutor/agents/chat/agent_loop.py:162-249`
+- `deeptutor/runtime/bootstrap/builtin_capabilities.py`
+
 ### 6.1 当前默认 Chat 实际使用哪一个 Agent Loop
 
 **状态：已验证**
@@ -2382,6 +2417,14 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-08-31
+
+- 在第 6 章补充当前源码与鼎校伴学简历口述的边界：确认当前 DeepTutor 仍是
+  `ChatOrchestrator -> Capability -> AgenticChatPipeline`；简历口径则收敛为
+  `TurnOrchestrator -> ChatPipeline -> AgentLoop`，取消 Capability 路由和前置 LLM 意图
+  分类，由 Agent Loop 通过直接回答或 Tool Selection 完成判断，业务跳转统一通过受控的
+  Action Tool 触发。
 
 ### 2026-08-30
 

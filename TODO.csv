@@ -1,0 +1,5 @@
+id,task,status,completed_at,notes
+1,核对口述稿和手册中的旧命名与旧意图分流,DONE,2026-08-31,已定位 ChatOrchestrator、ChatCapability 和前置意图识别的全部口述口径
+2,改写为 TurnOrchestrator 和 ChatPipeline 并补充职责说明,DONE,2026-08-31,已删除前置意图分类并改为 AgentLoop 通过 Tool Selection 判断意图
+3,同步学习手册的源码与简历口径边界,DONE,2026-08-31,已区分当前 DeepTutor 类名与简历目标架构
+4,校验旧口径残留、时长与文件差异,DONE,2026-08-31,git diff --check、关键口径、旧命名与 UTF-8 检查通过；约 3 分钟和 5.3 分钟
