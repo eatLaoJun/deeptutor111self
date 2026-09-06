@@ -431,7 +431,7 @@ Capability 的基础协议位于 `deeptutor/core/capability_protocol.py`，注�
 
 ### 5.4 StreamEvent 与 StreamBus
 
-**状态：已验证到主流程**
+**状态：已验证到主流程与事件缓冲边界**
 
 相关文件：
 
@@ -442,11 +442,31 @@ Capability 不直接依赖某个 UI，而是向 `StreamBus` 发出统一事件�
 
 这是一种“执行逻辑和展示方式解耦”的设计：能力只描述发生了什么，入口决定如何显示。
 
-StreamBus 的机制层可拆成三件套（实现细节在 `stream_bus.py`，第三阶段再核）：
+StreamBus 的机制层可拆成三件套（已核对 `stream_bus.py` 的 `emit/subscribe/close`）：
 
-- **异步队列**：内部用一个先进先出的 `asyncio.Queue` 存事件；队列空了消费者挂起等待、满了 producer 挂起等待，不丢不挤。
-- **多订阅者**：`subscribe()` 给每个调用方返回各自独立的消费游标/副本，CLI/Web/SDK 同时订阅时各收各的同一份事件流。
-- **显式收尾标记**：producer（capability）一停，`finally` 里 `emit(DONE)` 发最后一条事件、`close()` 打「不会再有下一条」标记；消费者那侧的 `async for` 不是靠队列瞬时空判定结束，而是看到这个标记才退出。
+- **异步队列**：`subscribe()` 为每个订阅者创建一个 `asyncio.Queue()`，空队列上的 `get()` 会挂起等待。当前未设置 `maxsize`，属于无界队列，不能说成“队列满了生产者自动等待”；`await q.put(event)` 本身不代表已经实现容量背压。
+- **多订阅者**：`emit()` 先把事件追加到 `_history`，再向各订阅队列放入同一个事件对象的引用，而非深拷贝整份 payload。新订阅者先回放历史，再消费自己的实时队列。
+- **显式收尾标记**：编排器在 `finally` 里发出 `DONE`，随后 `close()` 设置 `_closed` 并向各订阅队列放入 `None` 哨兵。消费者处理完前面的事件后退出，不是因为队列暂时为空；关闭后的新订阅者则回放历史后直接结束。
+
+**本轮内存不只有 `messages`**
+
+`StreamBus._history` 在本轮持续保留已发出的事件，当前没有按条数或字节数裁剪；
+`close()` 也不清空它。取消订阅会移除对应队列，回合收尾会注销 bus，但对象仍需等其他
+引用释放后才可回收，不能把“关闭 Stream”理解成“立即清空所有内存”。
+证据：`deeptutor/core/stream_bus.py` 的 `__init__/emit/subscribe/close`，以及
+`deeptutor/runtime/orchestrator.py` 的 `handle()` 收尾。
+
+外层 `TurnRuntimeManager._run_turn()` 还会累积 `assistant_events` 和
+`content_segments`，供事件持久化和最终答案组装使用；`turn_runtime.py:1019` 的实时
+订阅队列同样未设置容量上限。因此容量评估还需计入事件对象、队列引用、序列化临时
+缓冲及工具返回值，不能只用 Prompt Token 数估算一个用户的全部内存。
+证据：`deeptutor/services/session/turn_runtime.py:1162`、`:1167`、`:1671`、`:1674`。
+
+**评估建议，不是当前容量实测**：区分“在线连接数”和“同时执行的 Turn 数”，按基础
+服务及所有 worker 常驻内存、空闲连接开销、活跃 Turn 增量和安全余量估算整机负载。
+外部 LLM/OCR 推理不在本机加载对应模型，但上传缓冲和返回结果仍可能占用本机内存；
+是否支持 200 人在线还应压测长会话、集中提问、大工具结果和慢消费者。上下文裁剪
+只限制发给模型的内容，不自动限制上述事件历史或队列，不能据此承诺固定人数上限。
 
 **关于 `_bus_registry`（模块级全局查找表，不是单例）**
 
@@ -709,6 +729,34 @@ RAG 有两条进入模型输入的路径：
 正文，不读取 `events_json`；Chat L1 Snapshot 同样不吸收 Tool Result 事件。工具若自身具有
 持久化副作用，例如 `write_memory`、`write_note` 或生成文件，则由对应 Service 保存业务结果，
 不能据此推导所有 Tool Result 都会自动进入长期记忆。
+
+#### Redis 能否存放 Agent Loop 的 `messages`
+
+**当前事实**：可以在架构上接入，但当前主链路没有 Redis Session Store。跨回合的
+user/assistant 消息由 `SessionStoreProtocol` 抽象，目前实现是 SQLite 或 PocketBase；
+`ContextBuilder.build()` 从 Store 读取并压缩历史，`AgentLoop.run()` 再创建本轮局部
+`messages`，后续 assistant tool calls 和 `role=tool` 结果直接追加到这份列表。
+证据：`deeptutor/services/session/protocol.py`、`context_builder.py:352-461`、
+`deeptutor/agents/chat/agent_loop.py:190-363`。
+
+**推荐方案，不代表当前已实现**：Redis 更适合作为跨 worker 的活跃 Turn 缓存或恢复
+checkpoint，而不是替代协程内的工作列表。建议执行路径为：
+
+```text
+持久化会话历史 -> 组装本地 messages -> Agent Loop 就地追加
+                                  -> 稳定轮次边界写 Redis checkpoint
+Turn 完成 -> 最终消息/事件写权威存储 -> 删除 Redis key 或等待 TTL
+```
+
+所谓“稳定边界”至少应保证一条 assistant tool-call 声明与它对应的全部 `role=tool`
+结果已经配对，避免进程在中间失败后恢复出违反模型协议的半轮状态。checkpoint 还应保存
+`turn_id`、轮次、版本号、状态和过期时间，并通过版本比较、事务或 Lua 保证并发更新不会
+相互覆盖；大型 Tool Result 只保存摘要和对象存储引用，不把原始文件塞进 Redis。
+
+这种设计的主要收益是 WebSocket 重连、worker 故障转移和多实例接续执行，而不是凭空
+节省内存。Redis 本身也是内存系统；如果和应用部署在同一台 16 GB 服务器，只是把数据从
+Python 堆移动到 Redis，并增加序列化副本。每次 append 都把整份 256K 上下文远程覆写，
+还会放大网络和序列化开销，因此应按完成轮次或关键状态点 checkpoint，而非逐条消息写。
 
 当前 Loop 接近上下文窗口的 90% 时，还会优先把早期 `role=tool` 正文替换为裁剪提示。这进一步
 说明 Tool Result 是本轮工作记忆，而不是稳定长期记忆。准确概括是：**本轮原文回填、事件轨迹
@@ -2417,6 +2465,15 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-09-06
+
+- 修正 5.4 节的 StreamBus 队列描述：当前为每订阅者无界队列、共享事件引用，
+  而非有界背压或深拷贝；补充 `_history`、外层事件缓冲与关闭后的对象生命周期，
+  明确 Prompt 大小、活跃 Turn 内存和在线用户容量是不同口径，人数上限仍需压测。
+- 在 5.6 节补充 Redis 保存 Agent Loop `messages` 的边界：确认当前主链路仍使用
+  SQLite/PocketBase 保存会话、本地列表承载本轮循环；给出 Redis 作为跨 worker 活跃
+  Turn checkpoint 的推荐路径、协议配对边界、并发版本控制和 TTL 要求。
 
 ### 2026-08-31
 

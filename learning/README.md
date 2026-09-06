@@ -15,6 +15,13 @@
   重点讲 L1 原始事件、L2 场景记忆、L3 增量归并和关系库实现。
 - `interview-scripts/鼎校伴学-Agent-Runtime-3分钟与5分钟.md`：对应简历第一条职责，包含
   Agent Runtime 专项 3、5 分钟口述稿、速记主线和表达边界。
+- `interview-scripts/鼎校伴学-Agent-Runtime-面试追问.md`：主 Agent/Subagent、Skill、DAG、
+  Plan 模式、指标口径与项目亮点；区分当前项目介绍与扩展设计。
+- `interview-scripts/鼎校伴学-第三条-K12教材RAG面试讲解.md`：对应简历第三条职责，覆盖
+  教材入库、Qdrant + BM25 双路召回、RRF 融合、Qwen-Rerank 重排、指标及高频追问；默认
+  使用 60 秒版本，把面试重点留给 Agent Runtime 和三层记忆。
+- `interview-scripts/AI全栈工程师-3分钟自我介绍.md`：面向 AI 全栈岗位的完整自我介绍，
+  明确鼎校伴学是鼎校甄选中的 AI 入口，以及本人参与的 3 类重点学习服务。
 
 与项目正式知识库的区别：
 
