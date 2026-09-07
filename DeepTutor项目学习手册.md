@@ -122,6 +122,29 @@ DeepTutor 是一个 agent-native 智能学习伴侣。它不是把所有学习�
 
 前端依赖和命令定义在 `web/package.json`。源码位于 `web/app/`、`web/components/`、`web/features/`、`web/lib/` 等目录。
 
+#### 前端 Hook 与状态管理的实际用法
+
+**状态：已验证**
+
+Hook 是 React 函数组件复用状态和副作用逻辑的机制，不只是“以 `use` 开头的工具函数”。
+本项目前端没有额外引入 Redux 或 Zustand；主聊天状态集中在
+`UnifiedChatProvider` 中：`useReducer` 管理消息、会话和流式状态的成组迁移，`useRef`
+保存 runner、重连定时器及最新状态等不应触发渲染的可变对象，`useCallback` 稳定发送、取消、
+重试等操作函数，`useMemo` 计算派生状态和稳定 Context value，`useEffect` 负责订阅、定时器和
+卸载清理。这里的职责边界比背 API 名称更重要：展示状态用 state/reducer，外部系统同步用
+effect，跨渲染但不驱动界面的对象用 ref，memo/callback 主要用于避免不必要的重新计算或
+引用变化，不能把它们当作业务正确性的保障。
+
+项目还把可复用交互抽成自定义 Hook。例如 `useSmoothStreamText` 用 state、ref、effect 和
+`requestAnimationFrame` 平滑展示 WebSocket 增量，并在停止流或组件清理时取消动画；
+`useChatAutoScroll` 用 ref 保存 DOM 和是否跟随底部，用 layout effect 在浏览器绘制前校正
+滚动位置，并清理动画帧、MutationObserver、定时器和事件监听。Hook 必须稳定地在函数组件或
+自定义 Hook 顶层调用，不能放进普通条件、循环和事件处理函数，否则 React 无法依靠调用顺序
+正确关联各次渲染的 Hook 状态。
+
+关键证据：`web/context/UnifiedChatContext.tsx:916-1885`、
+`web/hooks/useSmoothStreamText.ts`、`web/hooks/useChatAutoScroll.ts`、`web/package.json`。
+
 ### 3.3 配置
 
 **状态：已验证**
@@ -1332,6 +1355,21 @@ Recall@5 的严格口径是：对每条标注问题，检查返回前 5 个 Chun
 Chunk 的标注、两组逐题检索结果和评测脚本。当前仓库尚无这些评测产物，所以这组数字只能
 视为待业务报表验证的简历口径，不能由 hybrid 配置本身推导出来。
 
+Faithfulness 属于生成阶段指标，不是“回答引用了多少召回文本”，也不是 Recall 或答案正确率。
+它先把回答拆成可验证的原子陈述，再判断每条陈述能否由本次实际提供给模型的
+`retrieved_contexts` 推出，单条样本可概括为
+`被上下文支持的陈述数 / 回答中的全部陈述数`；允许改写，不要求逐字引用。它检验的是
+“回答有没有超出证据”，无法证明模型内部是否真的使用了某段文本，也不直接检验引用标注是否
+指向正确来源。后两项需要另做 citation 或人工评测。
+
+要把 `Faithfulness 0.82 -> 0.90` 归因于元数据过滤和 Top-5 收敛，必须固定测试集、语料、
+生成模型、Prompt、生成参数、评审模型及其版本，保存每题的 Query、实际检索上下文、回答、
+原子陈述和逐条判定，再对每题分数求平均。若过滤和 Top K 同时变化，只能归因于组合方案；
+要区分贡献，应分别评测“无过滤 + 原 Top K”“过滤 + 原 Top K”和“过滤 + Top 5”。当前
+`learning/notes/鼎校伴学-STAR简历改写.md:80-93` 明确把这组数标为模拟口径，仓库也没有
+对应 RAGAS 报告，因此不能当作当前源码已经验证的效果。官方定义参考 Ragas
+[Faithfulness](https://github.com/vibrantlabsai/ragas/blob/main/docs/concepts/metrics/available_metrics/faithfulness.md)。
+
 600 条问题的抽样依据不应是“旧系统已经回答正确”，否则会产生幸存者偏差。合理做法是
 先定义一个固定时间窗口内所有触发 RAG 的脱敏有效 Query 作为候选池，去除寒暄、重复、
 缺少必要上下文和知识库中不存在证据的问题；再按照业务场景/学科、资料类型、问题意图以及
@@ -1917,6 +1955,104 @@ a, b = await asyncio.gather(run_a(), run_b())
 - 批内同名同参数调用只真正执行第一项，后续项产生占位 `role=tool` 结果；`ask_user`
   在同批中无论参数是否相同，也只保留第一个暂停请求。
 
+#### 工具参数校验和重试触发的实际边界
+
+**状态：当前行为已验证**
+
+`ToolDefinition.to_openai_schema()` 会把工具参数定义转换成提供给模型的 JSON Schema，但这不
+等于服务端在执行前已经按同一份 Schema 做了完整校验。当前 `_prepare_tool_args()` 使用
+`parse_json_response()` 解析并尝试修复模型参数；完全无法解析或解析结果不是对象时退化为
+`{}`。随后 `ToolRegistry.execute()` 直接调用 `await tool.execute(**kwargs)`，没有统一调用
+`jsonschema.validate()`、Pydantic model 或等价的中央参数 Validator。
+
+因此当前缺失必填字段、类型错误和业务前置条件主要有两种结果：具体工具主动返回
+`ToolResult(success=False)`，或者 Python 调用/工具实现抛出异常，再由 `execute_tool_call()`
+捕获并转换成失败结果。下一轮模型可以根据错误重新生成一个 Tool Call，但这不是 Runtime
+基于错误类型执行的自动重试。若增加通用重试层，建议先把错误标准化为 `code`、`retryable`、
+`retry_after_ms`、`side_effect_state` 和 `attempt`；参数、权限及确定性业务错误不应按原参数
+重试，临时网络错误才进入有上限的退避策略。
+
+另一个容易遗漏的迁移点是：节点返回 `success=False` 在图运行时看来仍可能是一次正常返回。
+若以后接入 LangGraph `RetryPolicy`，包装节点必须检查结构化错误并对可重试类别抛出明确异常，
+或者用条件边路由到自定义 `RETRY_WAIT`；仅配置 `RetryPolicy` 不会自动理解 DeepTutor 的
+`ToolResult.success`。
+
+关键证据：`deeptutor/core/tool_protocol.py:47-94,121-153`、
+`deeptutor/core/agentic/tool_dispatch.py:268-292,337-467`、
+`deeptutor/utils/json_parser.py:34-105`、
+`deeptutor/runtime/registry/tool_registry.py:138-151`。
+
+#### Agent Loop、批次 Dispatcher 与显式 Plan Scheduler 的边界
+
+**状态：当前行为已验证；Planner 部分为演进设计，尚未实现**
+
+默认 Chat 当前采用边执行边决策的方式，没有先调用一个全局 Planner 生成完整工具 DAG。
+模型每轮返回的 `tool_calls` 只有调用 ID、工具名和参数，没有 `depends_on`；
+`dispatch_tool_calls()` 会把本轮收到的调用全部视为同一批，在去重和数量裁剪后并发执行，
+不会跨模型轮次维护节点依赖或 `PENDING/READY/RUNNING` 状态。因此它是批次 fan-out/fan-in
+执行器，不是持续运行的 Tool Loop 或 DAG Scheduler。
+
+假设逻辑依赖是 `A -> [B, C] -> D`，当前主链需要按下面的模型轮次展开：
+
+```text
+Round 1: LLM -> A       -> A 结果回填
+Round 2: LLM -> B || C  -> B、C 结果回填
+Round 3: LLM -> D       -> D 结果回填
+Round 4: LLM -> 无 tool call，生成最终回答
+```
+
+最后一步仍是同一个 Agent Loop 的下一轮模型调用，不是重新启动第二个 Agent Loop。如果模型
+在一次回复中同时发出 A、B、C、D，当前 Dispatcher 无法得知上述依赖，会把它们按同批并发
+处理。普通异常会由 `execute_tool_call()` 转成失败结果，但 `ToolRegistry.execute()` 只是直接
+调用具体工具；当前没有对所有工具统一生效的自动重试、退避或节点失败传播状态机。模型可以
+在下一轮再次发起调用，具体工具也可以自行实现重试，但 `max_iterations` 只限制模型轮次，
+不等于工具超时或通用重试预算。
+
+若以后要支持依赖稳定、需要断点恢复和审计的长任务，可以增加可选的结构化 Planner：先输出
+包含 `id`、`tool`、`depends_on`、`timeout`、`retry_policy`、`required` 和 `side_effect` 的
+PlanGraph，经 Runtime 校验工具白名单、权限、预算和依赖环后，再交给 Plan Scheduler Loop。
+Scheduler 维护 `PENDING -> READY -> RUNNING -> SUCCEEDED/FAILED`，以及 `RETRY_WAIT`、
+`BLOCKED`、`CANCELLED`；只释放依赖满足的节点，在并发配额内执行 READY 集合。并行分支部分
+失败时保留成功结果，阻断依赖失败节点的下游，独立节点是否继续及整个计划是否 fail-fast 由
+节点策略决定。只对可重试且幂等的错误做有上限的退避重试；写操作结果未知时先用幂等键或
+状态查询确认，不能盲目重放。该方案属于明确的后续实现路径，不能表述为当前默认 Chat 已有能力。
+
+#### LangGraph 参考语义与演进注意事项
+
+**状态：LangGraph 官方语义已核对；以下接入方式是演进设计，尚未实现**
+
+LangGraph 是图运行时，不会自动生成符合鼎校伴学业务语义的 Planner。若用于上述演进路径，
+可以把 Planner、Plan Validation Gate、Scheduler/Worker 和 Evaluator/Replanner 建成节点或
+子图，同时注意以下边界：
+
+1. `StateGraph` 可以用边直接表达 `A -> [B, C] -> D`：B、C 在同一 superstep 并行，D 在
+   两者结束后执行。并行节点若更新同一个 state key，必须定义 reducer，或将结果按节点 ID
+   写入独立字段，否则会产生并发更新冲突。
+2. LangGraph 将并行 superstep 作为事务边界。某个分支抛出未捕获异常时，本 superstep 的
+   更新不会直接应用；配置 checkpointer 后，成功分支的 pending writes 会被保存，恢复时
+   不必重复执行成功分支。DeepTutor 当前 Dispatcher 则先在每个调用内部把普通异常转换为
+   结果，再整批回填，二者不是同一种故障语义。
+3. 节点级 `RetryPolicy` 按异常类型决定是否重试，可以结合 attempt timeout；重试耗尽后再
+   进入 `error_handler` 或补偿路径。它仍要求应用定义错误分类、最大次数、总 deadline 和
+   写操作幂等，不能把所有异常都设为可重试。
+4. Checkpointer 保存 thread 范围内的图状态，用于中断、故障恢复和回放；Store 用于跨 thread
+   的用户偏好、事实等长期数据。它们分别对应“执行恢复状态”和“长期用户画像”，不能混用。
+5. `interrupt()` 适合缺少用户信息或写操作审批。恢复会从当前节点开头重新执行，所以中断前
+   的副作用必须幂等；中断使用运行时控制异常，也不能被宽泛异常捕获当成普通失败。
+6. `recursion_limit` 限制图的 superstep 数，不等于节点 `max_attempts`、LLM Token Budget、
+   工具 timeout 或整次 Turn 的 deadline，这些预算仍需分别维护。
+
+官方参考：LangGraph [Graph API](https://docs.langchain.com/oss/python/langgraph/use-graph-api)、
+[Fault tolerance](https://docs.langchain.com/oss/python/langgraph/fault-tolerance)、
+[Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)、
+[Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)、
+[Functional API](https://docs.langchain.com/oss/python/langgraph/functional-api)，以及 LangChain
+[INVALID_TOOL_RESULTS](https://docs.langchain.com/oss/python/langchain/errors/INVALID_TOOL_RESULTS)。
+
+关键证据：`deeptutor/agents/chat/agent_loop.py:333-365`、
+`deeptutor/core/agentic/tool_dispatch.py:84-201,337-467`、
+`deeptutor/runtime/registry/tool_registry.py:138-151`。
+
 #### 已验证的 8 项截断协议风险
 
 Chat Loop 当前先把模型返回的**全部** `result.tool_calls` 写入 assistant message，随后
@@ -1955,6 +2091,33 @@ Chat Loop 当前先把模型返回的**全部** `result.tool_calls` 写入 assis
 日志中的参数最多保留 500 个字符；以下划线开头的服务端私有参数不会输出，
 `token`、`password`、`secret`、`api_key` 等密钥类字段会显示为
 `<redacted>`。日志只记录结果长度和执行状态，不输出完整工具结果。
+
+#### 工具状态标识的真实边界
+
+**状态：已验证**
+
+当前实现有轻量级状态信号，但没有一套持久化的通用工具状态机：
+
+- 工具返回契约中的 `ToolResult.success` 表示本次执行的业务成功或失败，此外还可携带
+  `pause_for_user` 和 `terminate_turn`。
+- 通用流事件以相同的 `tool_call_id` 配对：执行前发出 `TOOL_CALL`，执行结束后发出
+  `TOOL_RESULT`。普通异常会在 dispatcher 内转换为失败结果，随后仍发出 `TOOL_RESULT`，
+  因此不会破坏 tool call/result 配对。
+- 检索类调用还会额外发出 `PROGRESS(call_state=running|complete|error)`；这里的
+  `complete` 表示调用协程已经正常返回，最终业务是否成功仍应以 `ToolResult.success` 为准。
+- 当前通用 `TOOL_RESULT` 事件的 metadata 没有统一透传 `success`，`role=tool` 消息也主要承载
+  文本内容；因此不能把“收到了 `TOOL_RESULT`”等同于“工具执行成功”。后端 TRACE 会单独记录
+  `success=True/False`。
+
+也就是说，当前可以观测“已发起、已返回以及返回是否成功”，但没有跨轮维护
+`PENDING/READY/RUNNING/SUCCEEDED/FAILED/RETRY_WAIT/BLOCKED`。这些节点状态只有引入显式
+Plan Scheduler 后才需要成为 Runtime 的一等状态。若后续要强化前端展示、自动重试和审计，
+至少应在标准事件中增加 `state`、`success`、`attempt`、`error_code`、`started_at` 和
+`finished_at`，并继续使用 `tool_call_id` 做关联。
+
+关键证据：`deeptutor/core/tool_protocol.py:121-153`、
+`deeptutor/core/agentic/tool_dispatch.py:337-467,492-573`、
+`deeptutor/core/stream_bus.py:157-190`。
 
 ### 6.8 重复调用、Deferred Tools 和 Context Checkpoint
 
@@ -2465,6 +2628,20 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-09-07
+
+- 在 6.7 节补充 Agent Loop、批次 Tool Dispatcher 与显式 Plan Scheduler 的边界：确认默认
+  Chat 没有全局 Planner、跨轮 `depends_on`、节点状态机或通用自动重试；用
+  `A -> [B, C] -> D` 说明当前多轮执行方式，并记录可选 Planner + Scheduler 的演进路径。
+- 补充工具参数校验的真实边界，并对照 LangGraph 官方语义记录并行 superstep、`RetryPolicy`、
+  timeout、error handler、checkpointer、interrupt、幂等副作用和长期 Store 的演进注意事项。
+- 补充工具状态标识的真实边界：区分 `ToolResult.success`、`TOOL_CALL/TOOL_RESULT` 生命周期
+  事件、检索 trace 的 `call_state`，并明确当前尚无通用持久化节点状态机。
+- 补充 RAGAS Faithfulness 的陈述级评测口径，区分它与 Recall、答案正确率和引用准确性，并
+  明确 `0.82 -> 0.90` 当前仍是缺少评测产物的模拟简历口径。
+- 在 3.2 节补充 React Hook 与状态管理的项目实例：说明 `useReducer`、`useRef`、
+  `useEffect`、`useMemo`、`useCallback` 和自定义 Hook 在聊天流式界面中的实际职责与清理边界。
 
 ### 2026-09-06
 

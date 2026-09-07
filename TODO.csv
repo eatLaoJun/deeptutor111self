@@ -1,5 +1,9 @@
 id,task,status,completed_at,notes
-1,核对口述稿和手册中的旧命名与旧意图分流,DONE,2026-08-31,已定位 ChatOrchestrator、ChatCapability 和前置意图识别的全部口述口径
-2,改写为 TurnOrchestrator 和 ChatPipeline 并补充职责说明,DONE,2026-08-31,已删除前置意图分类并改为 AgentLoop 通过 Tool Selection 判断意图
-3,同步学习手册的源码与简历口径边界,DONE,2026-08-31,已区分当前 DeepTutor 类名与简历目标架构
-4,校验旧口径残留、时长与文件差异,DONE,2026-08-31,git diff --check、关键口径、旧命名与 UTF-8 检查通过；约 3 分钟和 5.3 分钟
+1,核对当前 Agent Loop 与 Tool Runtime 的真实并发和异常语义,DONE,2026-09-07,已确认当前无全局 Planner/DAG 调度器；同轮调用 gather 并发且无通用自动重试
+2,设计 Planner 与双层循环的面试表达边界,DONE,2026-09-07,已区分当前 planning-in-the-loop 与可选 Planner+Plan Scheduler 演进路径
+3,把工具依赖图示例和异常兜底话术融入口述稿,DONE,2026-09-07,已加入 A->[B C]->D 展开方式、双循环边界、节点状态与分类兜底话术
+4,同步学习手册并校验口径和文件差异,DONE,2026-09-07,已同步 6.7 节和更新记录；diff check 与 Markdown 围栏检查通过；相关 27 项测试通过
+5,核对 LangGraph 的并行执行和故障恢复语义,DONE,2026-09-07,已核对 superstep、RetryPolicy、timeout、error_handler、checkpointer、interrupt 与幂等语义
+6,设计工具异常分类与 PlanGraph 状态流转话术,DONE,2026-09-07,已按执行前校验、执行故障、并行传播、副作用一致性和 Loop 收敛五层设计
+7,将完整追问话术融入 Agent Runtime 面试稿,DONE,2026-09-07,已加入当前选型理由、五层异常策略、A/B/C/D 状态流转和 LangGraph 映射
+8,同步学习手册并验证文档一致性,DONE,2026-09-07,已同步参数校验与 LangGraph 演进语义；diff check 和 Markdown 围栏通过；相关 27 项测试通过

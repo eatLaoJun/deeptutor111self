@@ -25,10 +25,12 @@
   -> UnifiedContext
   -> TurnOrchestrator（调度与回合生命周期）
   -> ChatPipeline（组装 Prompt、工具和运行参数）
-  -> Agent Loop
+  -> Agent Loop（同一 Turn 内的外层决策循环）
        -> 无 Tool Call 且有有效文本：直接回答
+       -> 有 Tool Call：本轮交给 Tool Dispatcher 批量执行
+            -> 同批调用统一并发；模型应把有依赖的调用留到后续轮次
+            -> 结果按 tool_call_id 回填，回到同一个 Agent Loop 的下一轮
        -> Action Tool：返回受控的业务入口数据，由前端展示按钮
-       -> RAG / 题库等 Tool：结果回填后继续推理
   -> 统一输出
   -> Session 消息与 Trace 持久化
 
@@ -71,7 +73,7 @@ Agent Loop 后，通过“直接回答或选择某个 Tool”完成真正的意�
 | TurnOrchestrator | 本轮怎么启动、转发和结束 | 调度、Stream、异常边界、`DONE` |
 | ChatPipeline | AgentLoop 启动前需要准备什么 | Prompt、messages、tools、Schema、模型与预算参数 |
 | Agent Loop | 当前应该回答还是行动 | LLM 推理、Tool Calling、结果回填和收敛 |
-| Tool Runtime | 被选中的工具怎么执行 | 参数解析与校验、可信参数注入、异步执行、结果封装与失败隔离 |
+| Tool Runtime | 被选中的工具怎么执行 | 参数解析、可信参数注入、异步执行、结果封装与失败隔离；参数约束由 Tool Schema 和具体工具共同承担 |
 
 Agent Runtime 是覆盖回合执行、上下文、事件、工具调度和异常收尾的整体运行体系。
 Agent Loop 是其中的决策循环，Tool Runtime 是其中的工具执行模块，并不是两套互不相关的系统。
@@ -206,6 +208,276 @@ forced_finish_without_tools 会补充停止探索的指令，不允许继续调�
 回答；这次调用失败或为空则使用兜底文本。它不是提前准备好的正确答案，也不能替代工具
 超时和任务取消。普通工具错误由 Tool Runtime 转成结果；取消信号不能当作可重试的普通
 业务错误吞掉。
+
+### 用 `A -> [B, C] -> D` 讲清 Planner、Agent Loop 和执行循环
+
+#### 为什么当前不单独引入 Planner
+
+当前 Agent 的任务半径比较短：知识点讲解和出题通常是直接生成或补一次检索；Action Tool
+只是把模型识别出的需求映射为已有业务入口；报告生成一般只需要读取少量业务结果，画像更新
+还是报告完成后的可选副作用。大多数请求只需少量工具批次就能收敛，不属于几十个节点、
+跨较长时间执行的稳定工作流。
+
+**面试主回答：**
+
+> 我们不是没有规划能力，而是把规划放在 Agent Loop 里做滚动规划。当前业务步骤短，而且
+> 下一步经常依赖刚拿到的工具结果，例如先看到测评是否存在，再决定生成报告还是引导用户
+> 去测评。若所有请求都先调用一次 Planner 生成完整 DAG，会增加一次模型延迟和 Token 成本，
+> 同时还要维护计划版本、节点状态和重规划逻辑，收益不高。因此当前选择动态 Agent Loop：
+> 每轮只决定眼下可执行的一批动作，结果回填后再决定下一步。固定的业务跳转则直接由代码和
+> Action 白名单约束，不交给 LLM 规划。只有以后出现长链路、稳定依赖、断点恢复或人工审批
+> 要求时，我才会增加可选的结构化 Planner 和 Plan Scheduler。
+
+#### 先按当前实现说
+
+当前主链没有独立 Planner，也没有维护 `depends_on` 的 DAG Scheduler。模型每轮只提交“现在
+要执行”的一批 Tool Call，Dispatcher 对这一批做一次 fan-out / fan-in；它本身不是一个持续
+决策的 Tool Loop，也不会分析跨批依赖。
+
+假设任务的依赖关系是先执行 A，再并行执行 B、C，两者都成功后执行 D，当前链路会这样展开：
+
+```text
+同一个用户 Turn / 同一个 Agent Loop
+
+模型 Round 1 -> tool_calls=[A]
+  Dispatcher Batch 1 -> A
+  A 结果回填
+
+模型 Round 2 -> 读取 A -> tool_calls=[B, C]
+  Dispatcher Batch 2 -> B || C
+  B、C 结果全部回填
+
+模型 Round 3 -> 读取 A/B/C -> tool_calls=[D]
+  Dispatcher Batch 3 -> D
+  D 结果回填
+
+模型 Round 4 -> 判断证据是否足够
+  无 Tool Call + 有效文本 -> 返回最终答案
+  仍不够 -> 继续调用、换工具，或在预算边界内降级收尾
+```
+
+所以“最后再进行一遍 Agent Loop”更准确的说法是：**工具结果回到同一个 Agent Loop 的下一
+个模型 Round，由模型判断是否满足回答条件**，不是重新创建第二个 Agent Loop。模型可以在
+较早轮次预判后续可能需要哪些动作，但当前执行协议只接收本轮 `tool_calls`；如果一次把
+A、B、C、D 全发出来，Dispatcher 看不到依赖元数据，会把它们当成同批独立调用并发执行。
+
+**面试口述：**
+
+> 当前方案属于边执行边规划，也就是 planning in the loop，而不是先生成完整 DAG 再执行。
+> 外层只有一个 Agent Loop，负责多轮决策和最终收敛；每一轮内部，Tool Dispatcher 只负责
+> 当前批次的并发执行和结果聚合。像 `A -> [B, C] -> D` 这样的依赖，通过多轮 Tool Calling
+> 自然展开：先 A，结果回填后并发 B、C，再回填后执行 D，最后仍由同一个 Loop 的下一轮
+> 判断证据是否足够。这样适合步骤会随观察结果变化的开放式对话，但它不是强约束的 DAG。
+
+#### 如果演进成显式 Planner + Plan Scheduler
+
+对于步骤多、依赖稳定、需要恢复或审计的任务，可以增加一条**可选的复杂任务路径**，而不是
+让所有普通问答都先付出一次 Planner 的延迟和 Token 成本：
+
+```text
+Agent Loop 判断需要结构化执行
+  -> Planner 产出结构化 PlanGraph
+  -> Plan Validation Gate 校验工具白名单、参数、依赖环、预算和权限
+  -> Plan Scheduler Loop
+       -> 计算 READY 节点
+       -> 在并发上限内执行当前批次
+       -> 更新节点状态和 attempt
+       -> 重试 / 阻断下游 / 降级 / 请求重新规划
+  -> 把计划执行摘要作为观察结果回填外层 Agent Loop
+  -> 外层决定补充计划、追问用户或生成最终回答
+```
+
+示例计划只保存可执行结构，不保存模型内部推理过程：
+
+```text
+A: depends_on=[]
+B: depends_on=[A]
+C: depends_on=[A]
+D: depends_on=[B, C]
+```
+
+面试时建议称为“结构化 Planner”或“PlanGraph”，不要把模型内部 CoT 当作可执行状态；Runtime
+依赖的是可校验、可持久化的节点和边，而不是一段不可审计的思考文本。
+
+`Plan Validation Gate` 是这里定义的工程边界，不是当前项目中的类，也不是 LangGraph 强制
+提供的标准组件。Planner 的输出来自概率模型，Scheduler 却要做确定性执行，所以中间至少要
+检查：Plan Schema、节点 ID 唯一性、工具是否存在、参数或上游变量引用是否可解析、依赖是否
+成环、权限与审批、最大节点数和并发预算。校验失败只允许有限次数让 Planner 修复；未通过的
+计划绝不进入执行层。
+
+这里才可以说有两个循环，但建议使用准确名称：
+
+| 循环 | 管什么 | 典型状态 |
+| --- | --- | --- |
+| 外层 Agent Loop | 模型决策、是否重规划、证据是否足够、最终回答 | round、messages、budget、finish |
+| 内层 Plan Scheduler Loop | DAG 节点依赖、并发批次、attempt 和失败传播 | `PENDING -> READY -> RUNNING -> SUCCEEDED/FAILED` |
+
+内层还需要 `RETRY_WAIT`、`BLOCKED`、`CANCELLED`；这些是显式计划节点状态，不要说成当前
+Dispatcher 已经维护。Planner 负责“生成候选计划”，Runtime 才负责“验证并执行计划”，规划权
+不等于执行权限。
+
+#### 异常和重试怎么回答
+
+> 我不会把兜底概括成“失败就一直重试”。我会先判断错误由谁能够修复：临时基础设施错误
+> 由 Runtime 有界重试；参数或选错工具这类错误回填给 LLM 修正；信息缺失则暂停向用户追问；
+> 权限、业务规则和代码缺陷不做原参数重试；写操作结果未知时先查状态，不能盲目重放。
+> 当前实现重点是把普通工具异常隔离成 Tool Result，让同批其他工具继续并让下一轮模型有机会
+> 调整，但还没有对所有工具统一生效的自动重试状态机。若引入 Plan Scheduler，才会把节点
+> attempt、退避、失败传播和恢复做成 Runtime 的确定性策略。
+
+##### 第一层：执行前错误
+
+| 情况 | 是否直接重试 | 处理方式 |
+| --- | --- | --- |
+| Tool Call 的 JSON 轻微损坏 | 否 | 可以先做一次确定性 JSON repair；仍无法解析就返回 `INVALID_ARGUMENT`，不能猜测关键参数 |
+| 缺少必填参数、类型或枚举错误 | 否 | 在执行前按 JSON Schema/Pydantic 校验，返回字段级错误；让模型修改参数后形成一个**新调用** |
+| 工具名不存在、未挂载或版本不兼容 | 否 | 返回 `TOOL_NOT_FOUND/TOOL_UNAVAILABLE`；刷新可用工具、选择替代工具或重新规划 |
+| 模型试图传入 `user_id`、权限或工作目录 | 否 | 忽略或覆盖不可信字段，由 Runtime 注入服务端身份和作用域；权限失败不能靠模型改参数绕过 |
+| Planner 缺字段、节点重名、依赖不存在或成环 | 否 | Validation Gate 拒绝整份计划；有限次数修复后退回动态 Loop 或明确失败，不执行半合法计划 |
+| 一轮工具过多或重复调用 | 否 | 按并发上限排队或为未执行项生成占位结果；同工具同规范化参数批内去重，但必须保持每个 `tool_call_id` 都有对应结果 |
+
+当前代码的真实边界要说准确：Tool Schema 会提供给模型，Dispatcher 会解析并尝试修复 JSON；
+解析失败或结果不是对象时会退化为 `{}`。`ToolRegistry.execute()` 本身没有再次按完整 JSON
+Schema 做统一校验，缺参和类型问题主要由具体工具返回 `success=False`，或由 Python 调用抛错
+后转成失败 Tool Result。因此“独立的执行前参数校验器”应作为加强项，不要说成当前已经完整
+实现。
+
+##### 第二层：执行中的错误
+
+| 错误类型 | 默认策略 | 关键限制 |
+| --- | --- | --- |
+| 网络闪断、连接重置、临时 5xx | 有界自动重试 | 仅针对明确的 `retryable` 异常，指数退避加 jitter，并受 `max_attempts` 和总 deadline 限制 |
+| 429 或下游过载 | 延迟重试或降并发 | 优先遵守 `Retry-After`，配合并发上限、限流和熔断；不能立即并发重放制造重试风暴 |
+| 查询类工具超时 | 通常可有限重试 | 每次 attempt 有独立 timeout；超出本 Turn 剩余时间就降级，不让一次工具无限占住事件流 |
+| 400、401、403、确定性业务拒绝 | 不自动重试 | 分别交给参数修正、重新认证/授权或业务提示；相同输入重试不会改变结果 |
+| 查无数据或返回空结果 | 通常不是系统异常 | 调整查询范围、换数据源、向用户补问信息，或明确“当前无数据”，不能把空结果伪装成成功证据 |
+| 工具代码缺陷、返回结构不符合协议 | 不盲目重试 | 记录 trace 和错误指纹并告警；隔离该工具，必要时走 fallback，避免用重试掩盖确定性 Bug |
+| CPU 密集或阻塞调用卡住事件循环 | 不是重试问题 | 放到线程池、进程池或独立 Worker，并提供真正可取消的 timeout 和资源清理 |
+| 用户或上游取消 | 绝不重试 | 传播取消信号，停止释放新节点，在 `finally` 中清理资源；不要捕获后包装成普通 Tool Error |
+
+工具错误最好统一为机器可判定的结构，而不只是一段字符串：
+
+```text
+ToolError {
+  code, message, retryable, retry_after_ms,
+  side_effect_state, details, tool_call_id, attempt
+}
+```
+
+这样 Runtime 根据 `code + retryable + side_effect_state` 决策，LLM 只负责需要语义调整的部分。
+如果工具已经把异常捕获成 `success=False`，对图运行时来说这个节点可能是“正常返回”；想让
+LangGraph 的 `RetryPolicy` 接管，就需要工具包装节点把可重试结果转换成明确异常，或者自己
+根据结构化结果路由到 `RETRY_WAIT`。
+
+##### 第三层：并行分支、结果回填和失败传播
+
+| 情况 | 处理方式 |
+| --- | --- |
+| B、C 并行，B 失败而 C 成功 | 不丢弃 C；B 进入有限重试或失败处理。D 在 B 未成功前不能变成 `READY` |
+| B 最终失败且 D 强依赖 B | D 进入 `BLOCKED`；无关分支继续。Planner/Agent 可生成 B2 替代路径，计划变更需升版本并重新校验 |
+| B 是可选节点，D 支持降级输入 | 将 B 标为 `FAILED/SKIPPED`，通过显式条件边释放降级版 D；不能临时假装 B 成功 |
+| 同批一个协程抛出未捕获异常 | 明确选择 fail-fast 还是 per-call isolation；不要依赖 `gather()` 默认行为来代表业务策略 |
+| 并行节点同时写同一状态字段 | 每节点写独立 key，或定义确定性的 reducer；不能让最后完成者静默覆盖前一个结果 |
+| Tool Result 太大、为空或不可序列化 | 大结果存对象存储并回填引用/摘要；空结果带明确状态；进入消息或 checkpoint 前验证可序列化性 |
+| Tool Call/Result 数量或 ID 不配对 | 不进入下一轮模型；对失败、拒绝、去重和超限调用也生成唯一的配对 Tool Result |
+
+##### 第四层：写操作、副作用和恢复
+
+- 检索、读取记录等只读工具可以在明确错误类型下重试；持久化报告、写画像、创建任务等写操作
+  必须携带幂等键，建议使用 `turn_id + tool_call_id`，并由数据库唯一约束或 upsert 兜底。
+- 写请求超时分成“确认未执行”和“结果未知”。只有确认未执行才直接重试；结果未知进入
+  `UNKNOWN_EFFECT -> VERIFYING`，先按幂等键查询，确认成功后再释放下游，确认失败后才重做。
+- 报告属于本轮主要产物，画像更新通常是 `required=false` 的后置副作用。画像写入失败不应
+  抹掉已经生成的报告；可以通过 outbox/补偿任务重试，并记录画像未更新，而不是对用户伪装
+  整条链完全成功。
+- Checkpoint 保存的是计划/工作流执行状态，不等于长期用户画像。恢复时可以复用已完成的
+  节点结果，但任何“已开始、未确认完成”的副作用仍要依靠幂等和状态核验。
+
+##### 第五层：避免无限重试和错误收敛
+
+至少同时设置五个边界：节点 `max_attempts`、相同输入失败指纹、最大 `replan_count`、Agent
+`max_rounds/recursion_limit`、整次 Turn 的 deadline 与 Token/工具预算。达到边界后的动作是
+fallback、返回 `PARTIAL/FAILED` 或人工介入，而不是把计数清零继续调用。外层 `DONE` 只表示
+事件流结束，不能用它代替业务成功状态。
+
+#### `A -> [B, C] -> D` 的完整节点状态流转
+
+```text
+初始： A=READY，B/C/D=PENDING
+
+执行 A：
+  A READY -> RUNNING -> SUCCEEDED
+  Scheduler 重新计算依赖：B/C -> READY，D 仍为 PENDING
+
+并行执行 B、C：
+  B READY -> RUNNING
+  C READY -> RUNNING
+
+全部成功：
+  B/C -> SUCCEEDED
+  D 的全部强依赖满足：D -> READY -> RUNNING -> SUCCEEDED
+  Plan -> COMPLETED，执行摘要回填外层 Agent Loop
+
+B 第一次遇到临时错误：
+  B RUNNING -> RETRY_WAIT(attempt=1)；C -> SUCCEEDED；D 保持 PENDING
+  退避时间到且预算允许：B -> READY -> RUNNING
+  B 成功后才释放 D
+
+B 最终失败：
+  B -> FAILED；C 保留 SUCCEEDED；D -> BLOCKED
+  -> 有替代工具：生成 Plan v2，用 B2 替换 B，校验增量计划后继续
+  -> 无替代工具：Plan -> PARTIAL 或 FAILED，外层基于已有证据说明缺口
+
+B 是写操作且超时：
+  B -> UNKNOWN_EFFECT -> VERIFYING
+  -> 查到已落库：SUCCEEDED
+  -> 确认未落库：按幂等键回到 READY
+  -> 无法确认：停止 D，转人工或补偿，不能盲目重放
+
+任意非终态节点收到取消：-> CANCELLED；不再释放新的 READY 节点
+```
+
+Plan 级状态可以简化为
+`CREATED -> VALIDATING -> RUNNING -> COMPLETED/PARTIAL/FAILED/CANCELLED`，需要用户补充或审批
+时进入 `WAITING_INPUT/WAITING_APPROVAL`。节点级状态才使用 `PENDING/READY/RUNNING/...`，两层
+状态不要混用。
+
+#### 参考 LangGraph 时怎么表达
+
+LangGraph 是图运行时，不会自动替业务生成正确 Planner。可以把 Planner、Validation Gate、
+Worker、Evaluator/Replanner 建成节点或子图：
+
+```text
+START -> route_complexity
+  -> simple:  agent <-> tools -> END
+  -> complex: planner -> validate -> execute_plan_subgraph -> evaluate
+                                 ^                         |
+                                 +------- replan ----------+
+```
+
+对应关系和注意点：
+
+1. `StateGraph` 的边可以表达 `A -> [B, C] -> D`；B、C 在同一个 superstep 并行，D 等两者
+   完成后运行。并行节点更新同一 state key 时要配置 reducer，或者把结果按 node ID 分开保存。
+2. LangGraph 把并行 superstep 视为事务边界：某分支未捕获异常时，本 superstep 的更新暂不
+   应用；配置 checkpointer 后，成功分支的 pending writes 可以保存，恢复时只重跑失败分支。
+   这与当前 Dispatcher “每个工具先转成成功/失败结果再统一回填”的隔离策略不同，面试时
+   不要混为一谈。
+3. 节点可配置 `RetryPolicy`、attempt timeout 和 `error_handler`。顺序是先按异常类型重试，
+   重试耗尽后再进入 error handler/补偿路径；仍需自行决定哪些异常可重试以及写操作是否幂等。
+4. Checkpointer 用于线程级工作流状态和故障恢复，Store 才适合跨线程保存用户偏好、事实等
+   长期数据；不能把执行 checkpoint 直接称为用户画像。
+5. 缺少用户信息或高风险写操作审批可以用 `interrupt()` 暂停并持久化状态。恢复会从节点
+   开头重新执行，因此 interrupt 前的副作用必须幂等，也不能用宽泛 `except` 吞掉中断信号。
+6. 图循环仍要配置 `recursion_limit`；它限制 superstep，不等于单节点 `max_attempts`、LLM
+   Token Budget 或整个请求 deadline。
+
+官方参考：[Graph API：并行分支与 superstep](https://docs.langchain.com/oss/python/langgraph/use-graph-api)、
+[Fault tolerance](https://docs.langchain.com/oss/python/langgraph/fault-tolerance)、
+[Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)、
+[Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)、
+[Functional API：幂等与副作用](https://docs.langchain.com/oss/python/langgraph/functional-api)、
+[INVALID_TOOL_RESULTS](https://docs.langchain.com/oss/python/langchain/errors/INVALID_TOOL_RESULTS)。
 
 ### 白板上要讲清的协议配对
 
@@ -399,14 +671,17 @@ Runtime 注入当前用户身份并并发执行。假设 RAG 成功、学习记�
 TurnOrchestrator 管理本轮的启动、事件转发和异常收尾，ChatPipeline 准备 Prompt、工具
 Schema 和运行参数，然后进入 Agent Loop。
 
-Loop 维护当前回合的消息列表。模型可以直接回答，也可以返回工具名称和参数。Runtime 执行
-工具后，把结果按 tool_call_id 配对成 role=tool 消息，再交给下一轮模型。模型根据结果继续
-行动或输出答案，而不是预先写死所有步骤。
+Loop 维护当前回合的消息列表。模型可以直接回答，也可以返回工具名称和参数。比如依赖是
+`A -> [B, C] -> D`，模型可以先调用 A，结果回填后在下一轮并发调用 B、C，再执行 D；最后
+仍由同一个 Loop 的下一轮判断证据是否足够。当前采用这种边执行边规划，而不是预先生成 DAG。
+原因是讲解、出题、业务跳转和报告生成通常在少量步骤内收敛，单独 Planner 带来的额外模型
+延迟、计划状态和重规划成本，暂时大于它对这类短链路的收益。
 
 第二是工具执行。Tool Runtime 是 Agent Runtime 中负责动作执行的模块，通过 Tool Registry
 查找实现，解析参数，注入用户和 Session 等可信信息，统一返回 ToolResult。独立工具可以
 异步并发，有依赖的步骤分轮完成。普通工具异常会转换成错误结果，不直接打断同批其他工具，
-模型可以调整参数、换用其他工具，或者说明无法完成的部分。
+模型可以调整参数、换用其他工具，或者说明无法完成的部分。临时网络错误才适合有界退避重试；
+参数和权限错误不做原参数重试；写操作超时先查幂等状态；最大轮次会阻止模型无限尝试。
 
 第三是任务收敛和观测。通过最大轮次控制模型持续探索，对批内同名同参数调用去重，并裁剪
 较早的大段工具结果。达到轮次上限后，通过 Forced Finish 禁用工具，让模型基于已有信息
@@ -414,6 +689,8 @@ Loop 维护当前回合的消息列表。模型可以直接回答，也可以返
 
 业务上，用户说“我想检测词汇量”，模型通过受控 Action Tool 返回服务入口，前端展示按钮。
 这个 Turn 完成的是需求理解和入口引导，真正的测评由业务服务执行，Loop 不需要一直等待。
+业务结果已经存在时，Agent 可以读取结果生成报告，再把确实需要长期保留的信息作为可选写入
+更新到用户画像；画像更新失败不应抹掉已生成的报告。
 这套 Runtime 让知识检索和业务入口共享执行、异常处理与观测机制。我也参与了词汇量检测、
 英语三合一和试卷学情分析本身的设计开发，不只是完成入口对接。
 
@@ -437,6 +714,14 @@ Tool Call，Runtime 就执行对应工具，将结果按 `tool_call_id` 配对�
 再交给下一轮模型。模型根据观察结果决定继续调用工具还是输出答案，形成“模型决策、工具
 执行、结果回填、继续决策”的闭环，而不是预先写死所有步骤。
 
+例如依赖关系是 `A -> [B, C] -> D`，当前实现不是一开始生成完整执行图，而是第一轮调用 A，
+A 回填后下一轮并发调用 B、C，两者回填后再调用 D，最后由同一个 Agent Loop 的下一轮判断
+结果是否足以回答。这里 Tool Dispatcher 只是每轮的批量执行器，不是第二个持续决策的 Loop；
+如果模型把 A、B、C、D 一次全部发出，当前协议没有 `depends_on`，Runtime 会按同一批并发处理。
+我们没有给普通请求统一增加 Planner，是因为讲解、出题、Action 跳转以及读取结果后生成报告
+都是短链路，而且下一步常由最新观察决定；预先规划会增加一次 LLM 调用和第二套计划状态，
+还可能拿到结果后立即失效。这里是有意识地选择滚动规划，不是不了解 Planner。
+
 第二是工具执行。我们把工具运行职责集中到 Tool Runtime，它是 Agent Runtime 中负责动作
 执行的模块。模型看到的是工具描述和参数协议，真正的工具实现留在服务端。Runtime 通过
 Tool Registry 找到实现，解析参数，注入用户和 Session 等可信信息，再执行并统一封装
@@ -445,7 +730,17 @@ ToolResult。
 同一批中独立的工具可以异步并发，有依赖的步骤通过多轮调用完成。普通工具异常会被捕获并
 转换成错误结果，同批其他工具仍然可以完成。下一轮模型看到错误后，可以调整参数、换用
 其他工具，或者说明当前无法完成的部分。这里的重点是故障隔离和结果可处理，而不是承诺
-所有失败都能自动恢复。
+所有失败都能自动恢复。当前也没有对所有工具做无差别自动重试；是否重试要区分临时错误与
+参数、权限错误：网络闪断、临时 5xx 或限流可以按类型做有界退避；参数错误交给下一轮模型
+生成新调用；缺少用户信息就暂停追问；写操作结果未知时必须依靠幂等键或状态查询，不能盲目
+重复执行。节点 attempt、Agent 最大轮次和 Turn 总 deadline 共同防止无限重试。
+
+如果后续要支持依赖稳定、要求断点恢复的长任务，我会参考 LangGraph 增加可选 Planner，让它
+输出结构化 PlanGraph，经过 Schema、工具、参数、权限和依赖环校验后，再由 Plan Scheduler
+维护节点的 `PENDING/READY/RUNNING/SUCCEEDED/FAILED`、并发配额和有限重试。B、C 并行时
+如果 B 最终失败，保留 C 的结果并将依赖 B 的 D 标成 `BLOCKED`，再决定替换节点、部分返回
+还是失败结束。这样才是真正的“外层 Agent Loop + 内层计划执行循环”；普通问答仍走现有
+动态 Loop，避免每次请求都增加一次规划调用。
 
 第三是任务收敛和观测。我们通过最大轮次限制模型持续探索，对批内相同工具、相同参数的
 请求去重，并裁剪较早的大段工具结果，控制上下文增长。达到轮次上限后，通过 Forced Finish
@@ -454,7 +749,9 @@ Trace 则关联模型轮次和工具调用，帮助定位问题发生在决策�
 
 业务上，比如用户说“我想检测一下词汇量”，模型调用受控 Action Tool，后端返回对应服务
 入口，前端展示“开始检测”按钮。这个 Turn 完成的是需求理解和入口引导，真正的测评由业务
-服务执行，并不需要 Agent Loop 一直等待用户做完测评。
+服务执行，并不需要 Agent Loop 一直等待用户做完测评。已有业务结果则可以被 Agent 读取并
+生成报告，报告中真正稳定且需要跨会话使用的信息再选择性写入用户画像；报告是主要结果，
+画像更新是可独立补偿的后置副作用。
 
 这套 Runtime 的价值，是把对话中的动态决策和后端确定性执行分开，让知识检索、业务入口和
 后续新增工具共享同一套执行、异常处理与观测机制。同时，我也参与了词汇量检测、英语三合一
@@ -485,5 +782,13 @@ Trace 则关联模型轮次和工具调用，帮助定位问题发生在决策�
    Agent Loop 不需要跨越整段用户做题流程保持等待。
 9. **失败隔离不等于自动恢复。** 错误回填后，模型仍可能无法解决问题；只能说明它有机会
    调整参数、选择其他工具或明确告知限制，不承诺任意工具都能安全重试。
-10. 团队架构使用“我们建设”，个人职责使用“我主要参与”；入口连接约 7 类服务，个人
+10. **当前 Dispatcher 不等于 Planner 或 Tool Loop。** 它只并发执行本轮已经选出的调用，
+    不维护跨轮 `depends_on` 和节点状态；显式 Planner、DAG 与 Scheduler 只能作为演进设计讲。
+11. **Tool Schema 不等于完整的服务端参数校验。** Schema 主要约束模型输出，执行前仍应校验
+    类型、必填字段、权限和业务前置条件；当前统一 Dispatcher 没有独立的全量 Schema Validator。
+12. **LangGraph 不等于 Planner。** 它提供图、状态、重试、Checkpoint 和 Interrupt 等运行时
+    原语；Plan 的生成、校验、失败分类和业务补偿仍要由应用定义。
+13. **返回失败对象不一定触发框架重试。** `RetryPolicy` 面向节点抛出的异常；如果工具把错误
+    捕获成 `success=False`，需要包装节点显式抛出可重试异常或按错误码路由。
+14. 团队架构使用“我们建设”，个人职责使用“我主要参与”；入口连接约 7 类服务，个人
     重点参与词汇量检测、英语三合一和试卷学情分析，不要把团队成果全部说成个人独立完成。
