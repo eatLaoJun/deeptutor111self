@@ -2025,33 +2025,64 @@ LangGraph 是图运行时，不会自动生成符合鼎校伴学业务语义的 
 可以把 Planner、Plan Validation Gate、Scheduler/Worker 和 Evaluator/Replanner 建成节点或
 子图，同时注意以下边界：
 
-1. `StateGraph` 可以用边直接表达 `A -> [B, C] -> D`：B、C 在同一 superstep 并行，D 在
-   两者结束后执行。并行节点若更新同一个 state key，必须定义 reducer，或将结果按节点 ID
-   写入独立字段，否则会产生并发更新冲突。
+1. `StateGraph` 可以用边表达 `A -> [B, C] -> D`：`A -> B` 和 `A -> C` 让 B、C 在同一
+   superstep 并行；若 D 必须严格等待两个前置节点，应使用列表形式
+   `add_edge(["B", "C"], "D")`。它不是两条独立 `B -> D`、`C -> D` 边的缩写：分支长度不同时，
+   独立边可能让 D 在不同 superstep 执行多次；列表边则只在列出的节点都实际执行后运行一次，
+   若条件分支跳过其中一个节点，D 将不会运行。需要等待所有实际选中分支结束时，可以评估
+   `defer=True`，但它等待的是整张图没有 pending task，而不只是局部上游。调用图时还可传入
+   `config={"max_concurrency": N}` 限制同一时间的任务数。并行节点若更新同一个 state key，必须定义
+   reducer，或将结果按节点 ID 写入独立字段，否则会产生并发更新冲突。
 2. LangGraph 将并行 superstep 作为事务边界。某个分支抛出未捕获异常时，本 superstep 的
    更新不会直接应用；配置 checkpointer 后，成功分支的 pending writes 会被保存，恢复时
    不必重复执行成功分支。DeepTutor 当前 Dispatcher 则先在每个调用内部把普通异常转换为
    结果，再整批回填，二者不是同一种故障语义。
-3. 节点级 `RetryPolicy` 按异常类型决定是否重试，可以结合 attempt timeout；重试耗尽后再
-   进入 `error_handler` 或补偿路径。它仍要求应用定义错误分类、最大次数、总 deadline 和
-   写操作幂等，不能把所有异常都设为可重试。
+3. 节点级 `RetryPolicy` 只在节点尝试抛出符合 `retry_on` 的异常时重试，可以结合 attempt
+   timeout；节点正常返回 `success=False` 之类业务对象并不会自动触发它。重试耗尽后再进入
+   `error_handler` 或补偿路径。它仍要求应用定义错误分类、最大次数、总 deadline 和写操作
+   幂等，不能把参数错误、权限错误和确定性业务错误都设为可重试。
 4. Checkpointer 保存 thread 范围内的图状态，用于中断、故障恢复和回放；Store 用于跨 thread
    的用户偏好、事实等长期数据。它们分别对应“执行恢复状态”和“长期用户画像”，不能混用。
 5. `interrupt()` 适合缺少用户信息或写操作审批。恢复会从当前节点开头重新执行，所以中断前
    的副作用必须幂等；中断使用运行时控制异常，也不能被宽泛异常捕获当成普通失败。
-6. `recursion_limit` 限制图的 superstep 数，不等于节点 `max_attempts`、LLM Token Budget、
+6. `ToolNode` 可以执行一条 AI 消息中的多个工具调用，并自动注入 `ToolRuntime`。后者可提供
+   state、只读 invocation context、Store、stream writer、执行次数和 tool-call ID，而且
+   `runtime` 参数不会暴露给模型；但这只是运行时依赖注入，不是权限系统。生产代码仍应在构造
+   tool schema 时做可见性白名单，在工具执行入口再次校验用户和资源归属，把写文件/执行命令等
+   副作用放进沙箱或受限服务，并对高风险操作用 `interrupt`/HITL 做 approve/edit/reject。截至
+   2026-09-08，上游 Python `ToolNode._afunc()` 对单个 ToolNode 内的多个异步调用仍直接使用
+   `asyncio.gather(*coros)`；因此图调用的 `max_concurrency` 不应被当作可靠的逐工具外部服务限流，
+   工具或 Service 层仍需独立的 semaphore、连接池和速率配额。
+7. DeepTutor 当前对应的是分层执行授权：`turn_runtime` 先按用户 grant 过滤可选工具，chat
+   pipeline 再按上下文、Partner built-in 白名单和 MCP 白名单决定 schema，`_augment_tool_kwargs()`
+   注入模型不可控的用户、workspace 和 owner 信息；`exec` 最后还经过 isolation level、账号开关、
+   SandboxService 二次检查及每用户并发/频率配额。UI toggle 只是用户选择，不应被当成唯一权限边界。
+   当前仍有一个中央校验缺口：`dispatch_tool_calls()` 没有收到本轮 allowed tool set，
+   `ToolRegistry.execute()` 也会直接执行任意已注册名称；所以“未向模型暴露 schema”不能视为强制
+   执行授权。除 `exec` 等已有 Service 二次检查的工具外，后续还应在 dispatcher/registry 边界传入
+   并校验本轮不可扩大的白名单，防止模型或上游 Provider 产出未挂载但全局已注册的工具名。
+8. `recursion_limit` 限制图的 superstep 数，不等于节点 `max_attempts`、LLM Token Budget、
    工具 timeout 或整次 Turn 的 deadline，这些预算仍需分别维护。
 
-官方参考：LangGraph [Graph API](https://docs.langchain.com/oss/python/langgraph/use-graph-api)、
+官方参考：LangGraph [Graph API Overview](https://docs.langchain.com/oss/python/langgraph/graph-api)、
+[Use the Graph API](https://docs.langchain.com/oss/python/langgraph/use-graph-api)、
 [Fault tolerance](https://docs.langchain.com/oss/python/langgraph/fault-tolerance)、
 [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)、
 [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)、
-[Functional API](https://docs.langchain.com/oss/python/langgraph/functional-api)，以及 LangChain
-[INVALID_TOOL_RESULTS](https://docs.langchain.com/oss/python/langchain/errors/INVALID_TOOL_RESULTS)。
+[Functional API](https://docs.langchain.com/oss/python/langgraph/functional-api)、LangChain
+[Tools / ToolRuntime](https://docs.langchain.com/oss/python/langchain/tools)、
+[Human-in-the-loop](https://docs.langchain.com/oss/python/langchain/human-in-the-loop)，以及
+[INVALID_TOOL_RESULTS](https://docs.langchain.com/oss/python/langchain/errors/INVALID_TOOL_RESULTS)；
+当前 `ToolNode` 实现见上游
+[`tool_node.py`](https://github.com/langchain-ai/langgraph/blob/main/libs/prebuilt/langgraph/prebuilt/tool_node.py)。
 
 关键证据：`deeptutor/agents/chat/agent_loop.py:333-365`、
 `deeptutor/core/agentic/tool_dispatch.py:84-201,337-467`、
-`deeptutor/runtime/registry/tool_registry.py:138-151`。
+`deeptutor/runtime/registry/tool_registry.py:138-151`、
+`deeptutor/agents/chat/agentic_pipeline.py:448-570,860-970`、
+`deeptutor/multi_user/tool_access.py:32-83`、
+`deeptutor/services/session/turn_runtime.py:767-791`、
+`deeptutor/services/sandbox/service.py:65-95`。
 
 #### 已验证的 8 项截断协议风险
 
@@ -2628,6 +2659,15 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-09-08
+
+- 扩充 6.7 节的 LangGraph DAG 学习口径：区分 list-form join、独立入边和 `defer=True`，补充
+  `max_concurrency`、并行 state reducer、`ToolNode`/`ToolRuntime` 与节点异常重试边界；并把
+  LangGraph 的上下文注入和 HITL 映射到 DeepTutor 的用户 grant、MCP 白名单、服务端私参注入、
+  exec isolation、SandboxService 二次校验及配额，明确“工具可见”不等于“已完成执行授权”，
+  同时记录当前异步 `ToolNode` 内部 gather 不应被图级 `max_concurrency` 替代逐工具限流，并指出
+  DeepTutor Dispatcher/Registry 尚未对本轮 allowed tool set 做中央二次校验的现状风险。
 
 ### 2026-09-07
 
