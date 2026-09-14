@@ -614,6 +614,45 @@ textbook_filter = models.Filter(must=[
 结果验证、记忆追溯和异常回归共同控制风险。
 
 
+## 16. Harness 是什么？面试时如何解释？
+
+Agent Harness 可以理解为包在模型外面的执行与控制系统，负责把模型接到工具、上下文和
+运行规则上，使它不只是生成文本，而能受控地完成任务。它不是某个固定框架或模型，也没有
+所有团队完全一致的组件边界；狭义可指模型调用及工具路由循环，广义还包含状态恢复、预算、
+权限、观测和验证等工程能力。若上下文是 evaluation harness，则指运行测试和评分的评测设施，
+不能与 Agent 执行系统直接混同。
+
+### 一分钟面试口述
+
+我理解 Agent Harness 是模型外面的一套执行和控制机制。模型负责提出下一步行动，Harness
+负责准备上下文、执行允许的工具、回填结果，并控制超时、预算、取消和异常收尾。
+
+对应我的项目，Agent Runtime 和 Agent Loop 承担其中的核心执行职责，工具注册、参数校验、
+上下文管理和 Trace 都属于相关工程能力。在知识点学习工作流的设计中，任务状态和验证规则
+进一步约束什么时候讲解、什么时候等待学生，以及什么情况下允许进入下一阶段。
+
+比如模型认为材料不足、需要再查教材，程序先校验教材范围和剩余预算，再执行检索，把真实
+结果返回给模型。模型说学生已经掌握，也不能直接修改状态，仍要检查作答和理解验证证据。
+
+所以我不会把 Harness 当成一个新增的 Agent，而是把它理解为让 Agent 能够可靠运行的工程
+支撑。项目里已有能力和设计中的恢复、校验机制，要按真实落地进度分别说明。
+
+### 概念边界
+
+| 概念 | 关注什么 |
+| --- | --- |
+| 模型 | 基于输入生成回答或行动建议 |
+| Agent Loop | 模型决策、工具执行、结果回填的循环 |
+| Agent Runtime | 回合执行、工具调度及运行生命周期，具体范围依项目而定 |
+| Workflow | 业务阶段、分支、等待和状态推进规则 |
+| Agent Harness | 围绕模型组织执行与控制能力的整体工程视角，与 Runtime 高度重叠 |
+| Evaluation Harness | 测试输入、运行、环境重置和结果评分等评测设施 |
+
+Harness 不要求多 Agent、独立进程或额外的模型调用，也不只是 Prompt 或 Guardrails。
+使用 LangGraph 等框架可以实现其中部分机制，但工具授权、业务幂等和状态校验仍需要应用设计。
+
+记忆句：Loop 让模型循环行动，Harness 让整个行动过程可控、可验证。
+
 ## 参考资料
 
 - 项目设计背景：[消息路由、学习工作流与 Agent Loop](消息路由-学习工作流-AgentLoop分层讲解.md)。
@@ -634,3 +673,4 @@ textbook_filter = models.Filter(must=[
 - [Qdrant 索引](https://qdrant.tech/documentation/manage-data/indexing/)与[性能优化](https://qdrant.tech/documentation/ops-optimization/optimize/)：过滤索引、HNSW 参数与存储优化。
 - [Anthropic 构建有效 Agent](https://www.anthropic.com/engineering/building-effective-agents)：使用环境和工具反馈校验进展。
 - [NIST 生成式 AI 风险指南](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.600-1.pdf)：无依据内容与生成式 AI 风险。
+- [Anthropic 长任务 Harness](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)与[Managed Agents 架构](https://www.anthropic.com/engineering/managed-agents)：运行支撑与模型、工具执行循环的职责。
