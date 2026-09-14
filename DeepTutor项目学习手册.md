@@ -2288,6 +2288,39 @@ AgentLoop 的内存消息列表，不是数据库事务 checkpoint，也不是�
 - 已经完成过工具工作的中途失败，优先基于已收集材料给出 best-effort answer。
 - 轮数预算限制工具探索，但仍尽量保证用户最终拿到一段回答。
 
+#### 超时异常与固定文案兜底的边界
+
+源码静态核对：`deeptutor/agents/chat/agent_loop.py::_forced_finish()` 在已有材料时尝试
+禁用工具再请求模型，并不是自动切换备用模型。若该请求也异常，或收尾正文清洗后为空，
+`_finalize_finish()` 使用 `agents/chat/prompts/zh/agentic_chat.yaml` 中的
+`notices.empty_final_response` 固定文案，不再为该文案调用模型。该兜底返回
+`completed=True`，因此流程完成不能直接解释为用户问题得到有效解决。
+这里是单次执行的 best-effort 保护，不应据此宣称已经实现按共享超时率触发的服务熔断。
+在大面积模型故障下，额外收尾请求仍可能失败；跳过故障依赖、按总预算直接静态降级属于
+需要另行设计的治理策略。
+
+#### 面试专题：死循环保护与分布式熔断的边界
+
+已核对源码：`agents/chat/agentic_pipeline.py` 的 `DEFAULT_MAX_ROUNDS=8` 是默认值，
+实际使用 `effective_max_rounds(context)`，可由配置和 capability 的最低轮数要求调整。
+`agents/chat/agent_loop.py::_run_loop()` 使用有界循环，耗尽后 `_forced_finish()`
+禁用工具再请求一次 LLM，所以不能说整个回合最多只有 8 次模型请求，也不能把轮数上限
+等同于总耗时或费用硬上限。收尾请求也需要纳入未来的 deadline 和费用预算。
+
+`core/agentic/tool_dispatch.py::_detect_duplicate_calls()` 仅对同一批次的调用去重，
+不是跨轮循环检测，不能据此声称已识别 A → B → A 的无进展循环。
+`services/session/turn_runtime.py::TurnRuntimeManager` 把活跃执行放在进程内
+`_executions` 字典；`cancel_turn()` 找到本机任务后调用 `task.cancel()`，找不到时可更新
+持久化状态。持久化状态更新本身并不等于通知另一台 worker 停止执行。
+
+面向多实例的演进方案（不是当前已完成实现）：用外置状态存储维护 `turn_id` 对应的
+执行状态、步数、deadline、预算、取消标记和版本；在每次 LLM/工具调用前原子检查并预留
+额度。入口按用户或租户限流、限制在途并发并使用有界队列；下游模型或工具故障则使用
+Closed/Open/Half-Open 熔断器。单个回合循环异常只终止该回合，不应直接熔断所有用户。
+Worker 接管需要租约及由写入端校验的 fencing token，副作用工具需要幂等键。
+不能用本机内存不等于不能用 Redis；如果连内存型外部存储也禁用，可用数据库条件更新
+和事务实现状态机，但要承认吞吐和热点竞争代价。
+
 ### 6.11 流式显示和最终持久化为什么不会混在一起
 
 **状态：已验证**
@@ -2663,6 +2696,11 @@ http://127.0.0.1:3782
 ```
 
 ## 13. 更新记录
+
+### 2026-09-14
+
+- 核对默认 Chat 的轮数上限、额外收尾请求、批内去重与本机取消边界，补充死循环保护和
+  分布式熔断的面试口径，明确外置状态、预算预留及多实例取消属于演进方案。
 
 ### 2026-09-08
 
