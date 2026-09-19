@@ -1,0 +1,4 @@
+id,task,status,completed_at,notes
+1,Inspect SDK and environment,DONE,2026-09-16,Python 3.10 available; SDK pin selected
+2,Implement standalone CLI and documentation,DONE,2026-09-16,CLI and Chinese guide created
+3,Validate tests and pinned SDK,DONE,2026-09-16,7 tests passed; real SDK offline CRUD passed; live model calls not tested

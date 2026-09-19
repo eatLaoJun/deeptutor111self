@@ -1,0 +1,11 @@
+{
+  "llm_model": "YOUR_CHAT_MODEL",
+  "llm_base_url": "https://YOUR_PROVIDER/v1",
+  "embedding_model": "YOUR_EMBEDDING_MODEL",
+  "embedding_base_url": "https://YOUR_PROVIDER/v1",
+  "embedding_dims": 1536,
+  "milvus_url": "http://localhost:19530",
+  "milvus_collection": "mem0_learning_demo",
+  "milvus_db_name": "default",
+  "milvus_token": ""
+}
