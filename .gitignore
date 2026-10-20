@@ -311,3 +311,5 @@ celerybeat.pid
 *.wav
 *.ogg
 !demo/*.mp4
+
+/learning/.codex-tasks
